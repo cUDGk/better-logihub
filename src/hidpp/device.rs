@@ -2,7 +2,9 @@ use std::rc::Rc;
 
 use serde::Serialize;
 
-use super::transport::{HidTransport, HidppError, dpi_from_be, dpi_to_be, fn_sw, long_frame};
+use super::transport::{
+    HidTransport, HidppError, dpi_from_be, dpi_to_be, fn_sw, long_frame, short_frame,
+};
 
 const FEATURE_ROOT: u16 = 0x0000;
 const FEATURE_SET: u16 = 0x0001;
@@ -173,7 +175,7 @@ impl Device {
         Ok(features)
     }
 
-    fn require_feature(&self, feature_id: u16) -> Result<u8, HidppError> {
+    pub(crate) fn require_feature(&self, feature_id: u16) -> Result<u8, HidppError> {
         self.get_feature(feature_id)?
             .ok_or(HidppError::UnsupportedFeature(feature_id))
     }
@@ -185,11 +187,40 @@ impl Device {
     }
 
     fn call(&self, feature_idx: u8, function: u8, params: &[u8]) -> Result<[u8; 16], HidppError> {
+        self.call_long(feature_idx, function, params)
+    }
+
+    pub(crate) fn call_long(
+        &self,
+        feature_idx: u8,
+        function: u8,
+        params: &[u8],
+    ) -> Result<[u8; 16], HidppError> {
         let request = long_frame(self.dev_idx, feature_idx, fn_sw(function), params);
         let response = self.transport.transact(&request)?;
         let mut result = [0_u8; 16];
         result.copy_from_slice(response.params());
         Ok(result)
+    }
+
+    pub(crate) fn call_short(
+        &self,
+        feature_idx: u8,
+        function: u8,
+        params: &[u8],
+    ) -> Result<Vec<u8>, HidppError> {
+        if params.len() > 3 {
+            return Err(HidppError::Malformed(format!(
+                "short HID++ call has {} parameter bytes, maximum is 3",
+                params.len()
+            )));
+        }
+        let mut short_params = [0_u8; 4];
+        short_params[0] = fn_sw(function);
+        short_params[1..1 + params.len()].copy_from_slice(params);
+        let request = short_frame(self.dev_idx, feature_idx, short_params);
+        let response = self.transport.transact(&request)?;
+        Ok(response.params().to_vec())
     }
 }
 
