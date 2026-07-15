@@ -214,6 +214,42 @@ impl<'a> Onboard<'a> {
         Ok(())
     }
 
+    // libratbag: get fn 0xB (params[0]=index), set fn 0xC (params[0]=index, 0-based, <=4)
+    pub fn current_dpi_index(&self) -> Result<u8> {
+        let response = self
+            .device
+            .call_short(self.feature, 0x0B, &[])
+            .map_err(anyhow::Error::new)?;
+        response
+            .first()
+            .copied()
+            .context("getCurrentDpiIndex returned no data")
+    }
+
+    pub fn set_current_dpi_index(&self, index: u8) -> Result<()> {
+        ensure!(index <= 4, "DPI index must be 0..=4");
+        self.device
+            .call_short(self.feature, 0x0C, &[index])
+            .map_err(anyhow::Error::new)?;
+        ensure!(
+            self.current_dpi_index()? == index,
+            "DPI index read-back did not match"
+        );
+        Ok(())
+    }
+
+    // libratbag: fn 0x4, response params[1] = active profile index (1-based)
+    pub fn current_profile(&self) -> Result<u8> {
+        let response = self
+            .device
+            .call_short(self.feature, 0x04, &[])
+            .map_err(anyhow::Error::new)?;
+        response
+            .get(1)
+            .copied()
+            .context("getCurrentProfile returned no data")
+    }
+
     pub fn read_sector(&self, sector: u16, size: u16) -> Result<Vec<u8>> {
         let size = usize::from(size);
         ensure!(size >= 16, "sector size is smaller than one transfer");

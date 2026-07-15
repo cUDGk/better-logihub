@@ -151,6 +151,12 @@ enum OnboardCommand {
         #[arg(long)]
         device: Option<usize>,
     },
+    /// Set the active onboard DPI slot (0-based; persists across sleep).
+    SetDpiIndex {
+        index: u8,
+        #[arg(long)]
+        device: Option<usize>,
+    },
     Mode {
         mode: OnboardMode,
         #[arg(long)]
@@ -237,6 +243,8 @@ struct OnboardInfoResult {
     name: String,
     description: OnboardDescription,
     mode: String,
+    current_profile: u8,
+    current_dpi_index: u8,
     directory: Vec<DirectoryEntry>,
     directory_raw: String,
 }
@@ -286,6 +294,9 @@ fn main() -> Result<()> {
                 device,
             } => onboard_set_dpi(&levels, default, shift, device, cli.json),
             OnboardCommand::SetRate { hz, device } => onboard_set_rate(hz, device, cli.json),
+            OnboardCommand::SetDpiIndex { index, device } => {
+                onboard_set_dpi_index(index, device, cli.json)
+            }
             OnboardCommand::Mode { mode, device } => onboard_mode(mode, device, cli.json),
         },
         Command::Buttons { command } => match command {
@@ -628,12 +639,16 @@ fn onboard_info(index: Option<usize>, json: bool) -> Result<()> {
     let onboard = Onboard::new(&target.device)?;
     let description = onboard.description()?;
     let mode = mode_name(onboard.mode()?);
+    let current_profile = onboard.current_profile()?;
+    let current_dpi_index = onboard.current_dpi_index()?;
     let (directory_raw, directory) = onboard.directory(&description)?;
     let result = OnboardInfoResult {
         device: target.index,
         name: target.name.clone(),
         description,
         mode,
+        current_profile,
+        current_dpi_index,
         directory,
         directory_raw: hex_bytes(&directory_raw),
     };
@@ -649,6 +664,8 @@ fn onboard_info(index: Option<usize>, json: bool) -> Result<()> {
             "PROFILE",
             "MACRO",
             "SECTOR SIZE",
+            "ACTIVE PROFILE",
+            "DPI SLOT",
         ],
         &[vec![
             result.device.to_string(),
@@ -658,6 +675,8 @@ fn onboard_info(index: Option<usize>, json: bool) -> Result<()> {
             format!("0x{:02X}", result.description.profile_format_id),
             format!("0x{:02X}", result.description.macro_format_id),
             result.description.sector_size.to_string(),
+            result.current_profile.to_string(),
+            result.current_dpi_index.to_string(),
         ]],
     );
     println!("DESCRIPTION RAW: {}", hex_bytes(&result.description.raw));
@@ -797,6 +816,8 @@ fn onboard_set_dpi(
     let mut replacement = original.clone();
     set_onboard_dpi(&mut replacement, levels, default, shift)?;
     onboard.write_sector_verified(sector_id, &original, &replacement, false)?;
+    // Profile rewrites reset the live DPI slot to 0; move it to the new default.
+    onboard.set_current_dpi_index(default as u8)?;
     print_onboard_result(
         OnboardWriteResult {
             device: target.index,
@@ -809,6 +830,22 @@ fn onboard_set_dpi(
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            status: "verified".into(),
+        },
+        json,
+    )
+}
+
+fn onboard_set_dpi_index(dpi_index: u8, index: Option<usize>, json: bool) -> Result<()> {
+    let discovery = discover_with_warnings()?;
+    let target = single_device(&discovery, index)?;
+    let onboard = Onboard::new(&target.device)?;
+    onboard.set_current_dpi_index(dpi_index)?;
+    print_onboard_result(
+        OnboardWriteResult {
+            device: target.index,
+            name: target.name.clone(),
+            operation: format!("set current onboard DPI slot to {dpi_index}"),
             status: "verified".into(),
         },
         json,
