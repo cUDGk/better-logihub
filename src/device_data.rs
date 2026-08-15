@@ -23,7 +23,7 @@ pub struct DeviceRecord {
     pub gkeys: Gkeys,
     pub onboard: OnboardSupport,
     pub dpi_default: Option<DpiDefault>,
-    pub per_key_map: Option<BTreeMap<String, PerKeyEntry>>,
+    pub per_key_map: Option<PerKeyMap>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -69,6 +69,14 @@ pub struct PerKeyEntry {
     pub component: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerKeyMap {
+    #[serde(default)]
+    pub zone_scheme: Option<String>,
+    #[serde(flatten)]
+    pub entries: BTreeMap<String, PerKeyEntry>,
+}
+
 pub fn lookup(vid: u16, pid: u16) -> Option<&'static DeviceRecord> {
     if vid != 0x046D {
         return None;
@@ -99,12 +107,29 @@ mod tests {
         let keyboard = lookup(0x046D, 0x407C).unwrap();
         assert_eq!(keyboard.model_id, "g915");
         assert_eq!(keyboard.gkeys.count, Some(5));
-        assert!(keyboard.per_key_map.as_ref().unwrap().contains_key("41"));
+        assert!(
+            keyboard
+                .per_key_map
+                .as_ref()
+                .unwrap()
+                .entries
+                .contains_key("41")
+        );
 
         let mouse = lookup(0x046D, 0xC099).unwrap();
         assert_eq!(mouse.model_id, "g502x");
         assert_eq!(mouse.dpi_default.as_ref().unwrap().default, 1600);
         assert!(lookup(0x1234, 0xC099).is_none());
         assert!(lookup(0x046D, 0xFFFF).is_none());
+    }
+
+    #[test]
+    fn per_key_map_can_declare_a_wire_zone_scheme() {
+        let map: PerKeyMap = serde_json::from_str(
+            r#"{"zone_scheme":"hidusage","4":{"label":"A","component":"PERKEY_KEYBOARD_04"}}"#,
+        )
+        .unwrap();
+        assert_eq!(map.zone_scheme.as_deref(), Some("hidusage"));
+        assert!(map.entries.contains_key("4"));
     }
 }

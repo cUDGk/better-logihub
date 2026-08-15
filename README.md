@@ -30,6 +30,9 @@ G HUB の設定データベースからプロファイル (DPI テーブル・�
 | DPI 取得・設定 | `logihub dpi get` / `dpi set 3200` | 0x2202 / 0x2201 |
 | レポートレート取得・設定 | `logihub rate get` / `rate set 1000` | 0x8061 / 0x8060 |
 | フィーチャーテーブル dump | `logihub features` | 0x0001 |
+| 明るさの取得・設定 | `logihub brightness` / `brightness set 50` | 0x8040 |
+| ファームウェア RGB エフェクト | `logihub rgb info` / `rgb set ...` | 0x8071 |
+| キー単位 RGB フレーム | `logihub perkey set a=FF0000 ...` | 0x8081 |
 | G HUB プロファイル移行 | `logihub profile import-ghub` | settings.db (SQLite) |
 | プロファイル適用 | `logihub profile apply Desktop` | — |
 | オンボードボタン割り当て | `logihub buttons set 7 key:ctrl+c` | 0x8100 |
@@ -83,6 +86,36 @@ logihub dpi set 3200 --device 1
 logihub profile import-ghub
 logihub profile apply Desktop --device 1
 
+# キーボードの明るさ (割合またはデバイス生値)
+logihub brightness --device 3
+logihub brightness set 50 --device 3
+logihub brightness set raw 500 --device 3
+
+# 対応ゾーン・エフェクト・NV capability・電源モードを表示
+logihub rgb info --device 3
+
+# RAM だけに固定色を書き、消灯する (NVM は --persist nvm)
+logihub rgb set --zone 0 --effect fixed --color 00FF40 --persist ram --device 3
+logihub rgb set --zone all --effect colorwave --period 5000 --direction horizontal --device 3
+logihub rgb off --zone all --device 3
+
+# RGB 電源モード。数値の意味は機種依存なので生値として扱う
+logihub rgb power --device 3
+logihub rgb power set 1 --device 3
+
+# NV 設定の生読み書き (item は 0x0001 等、値は 7 byte)
+logihub rgb nv get 0x0001 --device 3
+logihub rgb nv set 0x0001 01 00 FF 40 00 00 00 --device 3
+
+# キー単位の色。zone-id の実機確認前は番号方式を必ず明示する
+logihub perkey set a=FF0000 b=00FF00 --zone-scheme hidusage --device 3
+logihub perkey fill 202020 --zone-scheme hidusage --device 3
+logihub perkey frame --from frame.json --zone-scheme hidusage --device 3
+logihub perkey clear --zone-scheme hidusage --device 3
+
+# A/B キーに候補ごとの色を書き、観察結果を入力する。方式は自動決定しない
+logihub perkey probe --device 3
+
 # ボタンにショートカットを割り当て (マウス本体のメモリに書くので常駐ソフト不要)
 logihub onboard dump --out backup.bin --device 1   # 書き込み前のバックアップ (必須)
 logihub buttons set 7 key:ctrl+c --device 1
@@ -109,7 +142,10 @@ logihub onboard exec-macro 6 0 --device 1
 
 ## 制限事項
 
-- ボタン割り当てはオンボードメモリ書き込みで対応 (`buttons set`)。キーストローク・マウスボタン・特殊操作・既存マクロ参照を割り当て可能。マクロ作成・ライティングは対象外
+- ボタン割り当てはオンボードメモリ書き込みで対応 (`buttons set`)。キーストローク・マウスボタン・特殊操作・既存マクロ参照を割り当て可能。マクロ作成は対象外
+- `rgb set` の既定は RAM (`--persist ram`)。`nvm` と `powersave` は不揮発領域へ書くため、意図した場合だけ指定してください
+- 0x8081 の zone-id は機種ごとに HID usage 方式と Solaar 方式の候補があります。`data/devices.json` に `zone_scheme` がない機種では `--zone-scheme hidusage|solaar` が必須です。`perkey probe` は観察結果を表示するだけで自動保存・自動判定しません
+- `perkey frame --from` は `{"a":"FF0000","esc":"00FF00"}` 形式です。`--persist` を付けない限り RAM フレームだけを書きます
 - オンボード書き込みは毎回「事前バックアップ必須 → CRC 検証 → 書き込み → 読み戻し照合」を通ります。壊れたら `onboard restore` で戻せます
 - 電源オフ / スリープ中の無線デバイスは `unreachable` と表示されます (レシーバーの仕様)
 

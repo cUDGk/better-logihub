@@ -1,19 +1,33 @@
 mod device_data;
 mod discovery;
 mod hidpp;
+mod lighting;
 mod onboard;
 mod output;
 mod profile;
 
+use std::fs;
+use std::io::{self, Write};
 use std::path::PathBuf;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
 use device_data::DeviceRecord;
 use discovery::{Discovery, ManagedDevice, discover, error_text};
 use hidpp::device::{BatteryStatus, FeatureInfo};
+use lighting::brightness::{
+    Brightness, BrightnessInfo, percent_from_raw as brightness_percent,
+    raw_from_percent as brightness_raw,
+};
+use lighting::perkey::{
+    PerKeyLightingV2, ResolvedKey, ZoneScheme, probe_zones, resolve_key, zones_from_usages,
+};
+use lighting::rgb::{
+    Effect, EffectOptions, Persistence, RgbCapabilities, RgbColor, RgbEffects, encode_effect,
+    parse_direction,
+};
 use onboard::{
     ButtonRow, Description as OnboardDescription, DirectoryEntry, Onboard, backup_path,
     button_rows, encode_dump, first_enabled_sector, load_dump, parse_binding, profile_name,
@@ -80,6 +94,158 @@ enum Command {
         #[command(subcommand)]
         command: ButtonsCommand,
     },
+    /// Inspect or set keyboard lighting brightness (0x8040).
+    Brightness {
+        #[command(subcommand)]
+        command: Option<BrightnessCommand>,
+        #[arg(long, global = true)]
+        device: Option<usize>,
+    },
+    /// Inspect or set firmware RGB effects (0x8071).
+    Rgb {
+        #[command(subcommand)]
+        command: RgbCommand,
+        #[arg(long, global = true)]
+        device: Option<usize>,
+    },
+    /// Send per-key RGB frames (0x8081).
+    Perkey {
+        #[command(subcommand)]
+        command: PerKeyCommand,
+        #[arg(long, global = true)]
+        device: Option<usize>,
+        #[arg(long, global = true, value_enum)]
+        zone_scheme: Option<ZoneSchemeArg>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum BrightnessCommand {
+    /// Set a percentage, or use `set raw N` for a device-native value.
+    Set {
+        value: String,
+        raw_value: Option<u16>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RgbCommand {
+    Info,
+    Set {
+        #[arg(long)]
+        zone: String,
+        #[arg(long)]
+        effect: String,
+        #[arg(long)]
+        color: Option<String>,
+        #[arg(long)]
+        color2: Option<String>,
+        #[arg(long)]
+        speed: Option<u16>,
+        #[arg(long)]
+        period: Option<u16>,
+        #[arg(long)]
+        brightness: Option<u8>,
+        #[arg(long)]
+        intensity: Option<u8>,
+        #[arg(long)]
+        direction: Option<String>,
+        #[arg(long, value_enum, default_value_t = PersistArg::Ram)]
+        persist: PersistArg,
+    },
+    Off {
+        #[arg(long, default_value = "all")]
+        zone: String,
+    },
+    Power {
+        #[command(subcommand)]
+        command: Option<RgbPowerCommand>,
+    },
+    Nv {
+        #[command(subcommand)]
+        command: RgbNvCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RgbPowerCommand {
+    Get,
+    Set {
+        #[arg(value_parser = parse_u8_arg)]
+        mode: u8,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RgbNvCommand {
+    Get {
+        #[arg(value_parser = parse_u16_arg)]
+        item: u16,
+    },
+    Set {
+        #[arg(value_parser = parse_u16_arg)]
+        item: u16,
+        #[arg(required = true, num_args = 1..=7)]
+        value: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum PerKeyCommand {
+    Probe,
+    Set {
+        #[arg(required = true)]
+        assignments: Vec<String>,
+        #[arg(long)]
+        persist: bool,
+    },
+    Fill {
+        color: String,
+        #[arg(long)]
+        persist: bool,
+    },
+    Clear {
+        #[arg(long)]
+        persist: bool,
+    },
+    Frame {
+        #[arg(long = "from")]
+        from: PathBuf,
+        #[arg(long)]
+        persist: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PersistArg {
+    Ram,
+    Nvm,
+    Powersave,
+}
+
+impl From<PersistArg> for Persistence {
+    fn from(value: PersistArg) -> Self {
+        match value {
+            PersistArg::Ram => Self::Ram,
+            PersistArg::Nvm => Self::Nvm,
+            PersistArg::Powersave => Self::PowerSave,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ZoneSchemeArg {
+    Hidusage,
+    Solaar,
+}
+
+impl From<ZoneSchemeArg> for ZoneScheme {
+    fn from(value: ZoneSchemeArg) -> Self {
+        match value {
+            ZoneSchemeArg::Hidusage => Self::HidUsage,
+            ZoneSchemeArg::Solaar => Self::Solaar,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -313,6 +479,82 @@ struct OnboardWriteResult {
     status: String,
 }
 
+#[derive(Serialize)]
+struct BrightnessResult {
+    device: usize,
+    name: String,
+    info: BrightnessInfo,
+    raw: u16,
+    percent: u8,
+    illumination: bool,
+}
+
+#[derive(Serialize)]
+struct BrightnessSetResult {
+    device: usize,
+    name: String,
+    requested_raw: u16,
+    effective_raw: u16,
+    percent: u8,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct RgbInfoResult {
+    device: usize,
+    name: String,
+    capabilities: RgbCapabilities,
+}
+
+#[derive(Serialize)]
+struct RgbWriteResult {
+    device: usize,
+    name: String,
+    effect: String,
+    zones: Vec<u8>,
+    persistence: String,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct RgbPowerResult {
+    device: usize,
+    name: String,
+    mode: u8,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct RgbNvResult {
+    device: usize,
+    name: String,
+    item: u16,
+    value: String,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct PerKeyWriteResult {
+    device: usize,
+    name: String,
+    zone_scheme: ZoneScheme,
+    keys: Vec<ResolvedKey>,
+    zone_count: usize,
+    requests: usize,
+    persistent: bool,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct PerKeyProbeResult {
+    device: usize,
+    name: String,
+    hidusage_expected: String,
+    solaar_expected: String,
+    answer: String,
+    status: String,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -373,6 +615,100 @@ fn main() -> Result<()> {
                 device,
             } => buttons_set(n, &binding, gshift, device, cli.json),
         },
+        Command::Brightness { command, device } => {
+            let discovery = discover_with_warnings()?;
+            match command {
+                None => brightness_get(&discovery, device, cli.json),
+                Some(BrightnessCommand::Set { value, raw_value }) => {
+                    brightness_set(&discovery, device, &value, raw_value, cli.json)
+                }
+            }
+        }
+        Command::Rgb { command, device } => {
+            let discovery = discover_with_warnings()?;
+            match command {
+                RgbCommand::Info => rgb_info(&discovery, device, cli.json),
+                RgbCommand::Set {
+                    zone,
+                    effect,
+                    color,
+                    color2,
+                    speed,
+                    period,
+                    brightness,
+                    intensity,
+                    direction,
+                    persist,
+                } => rgb_set(
+                    &discovery,
+                    device,
+                    &zone,
+                    &effect,
+                    color.as_deref(),
+                    color2.as_deref(),
+                    speed,
+                    period,
+                    brightness,
+                    intensity,
+                    direction.as_deref(),
+                    persist.into(),
+                    cli.json,
+                ),
+                RgbCommand::Off { zone } => rgb_set(
+                    &discovery,
+                    device,
+                    &zone,
+                    "off",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Persistence::Ram,
+                    cli.json,
+                ),
+                RgbCommand::Power { command } => match command {
+                    None | Some(RgbPowerCommand::Get) => {
+                        rgb_power(&discovery, device, None, cli.json)
+                    }
+                    Some(RgbPowerCommand::Set { mode }) => {
+                        rgb_power(&discovery, device, Some(mode), cli.json)
+                    }
+                },
+                RgbCommand::Nv { command } => match command {
+                    RgbNvCommand::Get { item } => rgb_nv_get(&discovery, device, item, cli.json),
+                    RgbNvCommand::Set { item, value } => {
+                        rgb_nv_set(&discovery, device, item, &value, cli.json)
+                    }
+                },
+            }
+        }
+        Command::Perkey {
+            command,
+            device,
+            zone_scheme,
+        } => {
+            let discovery = discover_with_warnings()?;
+            let scheme = zone_scheme.map(Into::into);
+            match command {
+                PerKeyCommand::Probe => perkey_probe(&discovery, device, cli.json),
+                PerKeyCommand::Set {
+                    assignments,
+                    persist,
+                } => perkey_set(&discovery, device, scheme, &assignments, persist, cli.json),
+                PerKeyCommand::Fill { color, persist } => {
+                    perkey_fill(&discovery, device, scheme, &color, persist, cli.json)
+                }
+                PerKeyCommand::Clear { persist } => {
+                    perkey_fill(&discovery, device, scheme, "000000", persist, cli.json)
+                }
+                PerKeyCommand::Frame { from, persist } => {
+                    perkey_frame(&discovery, device, scheme, &from, persist, cli.json)
+                }
+            }
+        }
     }
 }
 
@@ -509,7 +845,7 @@ fn device_info(discovery: &Discovery, index: Option<usize>, json: bool) -> Resul
                 model
                     .per_key_map
                     .as_ref()
-                    .map(|map| format!("{} HID usages", map.len()))
+                    .map(|map| format!("{} HID usages", map.entries.len()))
                     .unwrap_or_else(|| "-".into()),
             ],
         ];
@@ -734,6 +1070,692 @@ fn features(discovery: &Discovery, index: Option<usize>, json: bool) -> Result<(
         &rows,
     );
     Ok(())
+}
+
+fn brightness_get(discovery: &Discovery, index: Option<usize>, json: bool) -> Result<()> {
+    let target = single_device(discovery, index)?;
+    let brightness = Brightness::new(&target.device)?;
+    let info = brightness.info()?;
+    let raw = brightness.brightness()?;
+    let result = BrightnessResult {
+        device: target.index,
+        name: target.name.clone(),
+        info,
+        raw,
+        percent: brightness_percent(info, raw),
+        illumination: brightness.illumination()?,
+    };
+    if json {
+        return print_json(&result);
+    }
+    print_table(
+        &[
+            "DEVICE",
+            "NAME",
+            "BRIGHTNESS",
+            "RAW",
+            "MIN",
+            "MAX",
+            "STEPS",
+            "CAPS",
+            "ON",
+        ],
+        &[vec![
+            result.device.to_string(),
+            result.name,
+            format!("{}%", result.percent),
+            result.raw.to_string(),
+            result.info.min.to_string(),
+            result.info.max.to_string(),
+            format!("{} (safe {})", result.info.steps, result.info.safe_steps),
+            format!("0x{:02X}", result.info.capabilities),
+            result.illumination.to_string(),
+        ]],
+    );
+    Ok(())
+}
+
+fn brightness_set(
+    discovery: &Discovery,
+    index: Option<usize>,
+    value: &str,
+    raw_value: Option<u16>,
+    json: bool,
+) -> Result<()> {
+    let target = single_device(discovery, index)?;
+    let brightness = Brightness::new(&target.device)?;
+    let info = brightness.info()?;
+    let requested_raw = if value.eq_ignore_ascii_case("raw") {
+        raw_value.context("brightness set raw requires a raw level")?
+    } else {
+        ensure!(
+            raw_value.is_none(),
+            "unexpected second value; use `brightness set raw N`"
+        );
+        let percent = value
+            .parse::<u8>()
+            .with_context(|| format!("invalid brightness percentage {value:?}"))?;
+        brightness_raw(info, percent)?
+    };
+    ensure!(
+        (info.min..=info.max).contains(&requested_raw),
+        "raw brightness must be in the device range {}..={} ",
+        info.min,
+        info.max
+    );
+    let effective_raw = brightness.set_brightness(requested_raw)?;
+    let result = BrightnessSetResult {
+        device: target.index,
+        name: target.name.clone(),
+        requested_raw,
+        effective_raw,
+        percent: brightness_percent(info, effective_raw),
+        status: "set and read back".into(),
+    };
+    if json {
+        print_json(&result)
+    } else {
+        print_table(
+            &[
+                "DEVICE",
+                "NAME",
+                "REQUESTED RAW",
+                "EFFECTIVE RAW",
+                "PERCENT",
+                "STATUS",
+            ],
+            &[vec![
+                result.device.to_string(),
+                result.name,
+                result.requested_raw.to_string(),
+                result.effective_raw.to_string(),
+                format!("{}%", result.percent),
+                result.status,
+            ]],
+        );
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rgb_set(
+    discovery: &Discovery,
+    index: Option<usize>,
+    zone: &str,
+    effect_name: &str,
+    color: Option<&str>,
+    color2: Option<&str>,
+    speed: Option<u16>,
+    period: Option<u16>,
+    brightness: Option<u8>,
+    intensity: Option<u8>,
+    direction: Option<&str>,
+    persistence: Persistence,
+    json: bool,
+) -> Result<()> {
+    let target = single_device(discovery, index)?;
+    let rgb = RgbEffects::new(&target.device)?;
+    let capabilities = rgb.capabilities()?;
+    let effect = Effect::parse(effect_name)?;
+    let zones = select_rgb_zones(&capabilities, zone)?;
+    let options = EffectOptions {
+        color: color.map(str::parse).transpose()?,
+        color2: color2.map(str::parse).transpose()?,
+        speed,
+        period_ms: period,
+        brightness,
+        intensity,
+        direction: direction.map(parse_direction).transpose()?,
+    };
+    let params = encode_effect(effect, &options)?;
+    for cluster_index in &zones {
+        let cluster = &capabilities.clusters[usize::from(*cluster_index)];
+        let supported = cluster
+            .effects
+            .iter()
+            .find(|candidate| candidate.id == effect.raw_id)
+            .with_context(|| {
+                format!(
+                    "zone {} does not support effect {} (supported: {})",
+                    cluster.index,
+                    effect.name,
+                    cluster
+                        .effects
+                        .iter()
+                        .map(|effect| effect.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            })?;
+        rgb.set_effect(cluster.index, supported.index, params, persistence)?;
+    }
+    let result = RgbWriteResult {
+        device: target.index,
+        name: target.name.clone(),
+        effect: effect.name.into(),
+        zones,
+        persistence: persistence_name(persistence).into(),
+        status: "set".into(),
+    };
+    print_rgb_write(result, json)
+}
+
+fn rgb_info(discovery: &Discovery, index: Option<usize>, json: bool) -> Result<()> {
+    let target = single_device(discovery, index)?;
+    let capabilities = RgbEffects::new(&target.device)?.capabilities()?;
+    let result = RgbInfoResult {
+        device: target.index,
+        name: target.name.clone(),
+        capabilities,
+    };
+    if json {
+        return print_json(&result);
+    }
+    print_table(
+        &[
+            "DEVICE",
+            "NAME",
+            "CLUSTERS",
+            "NV CAPS",
+            "EXT CAPS",
+            "EXTRA",
+            "SW CONTROL",
+            "NON-RGB",
+            "POWER MODE",
+            "POWER CONFIG",
+        ],
+        &[vec![
+            result.device.to_string(),
+            result.name,
+            result.capabilities.device.cluster_count.to_string(),
+            format!("0x{:04X}", result.capabilities.device.nv_caps),
+            format!("0x{:04X}", result.capabilities.device.ext_caps),
+            format!("0x{:02X}", result.capabilities.device.extra),
+            result.capabilities.sw_control.enabled.to_string(),
+            result.capabilities.sw_control.non_rgb.to_string(),
+            result.capabilities.power_mode.to_string(),
+            format!(
+                "{}/{}/{}",
+                result.capabilities.power_mode_config.value_1,
+                result.capabilities.power_mode_config.value_2,
+                result.capabilities.power_mode_config.value_3
+            ),
+        ]],
+    );
+    let rows = result
+        .capabilities
+        .clusters
+        .iter()
+        .flat_map(|cluster| {
+            cluster.effects.iter().map(move |effect| {
+                vec![
+                    cluster.index.to_string(),
+                    format!("0x{:04X}", cluster.location),
+                    format!("0x{:02X}", cluster.persistence_caps),
+                    effect.index.to_string(),
+                    format!("0x{:04X}", effect.id),
+                    effect.name.clone(),
+                    format!("0x{:04X}", effect.capabilities),
+                    effect.period_ms.to_string(),
+                ]
+            })
+        })
+        .collect::<Vec<_>>();
+    print_table(
+        &[
+            "ZONE",
+            "LOCATION",
+            "PERSIST",
+            "INDEX",
+            "EFFECT ID",
+            "EFFECT",
+            "CAPS",
+            "PERIOD",
+        ],
+        &rows,
+    );
+    Ok(())
+}
+
+fn rgb_power(
+    discovery: &Discovery,
+    index: Option<usize>,
+    mode: Option<u8>,
+    json: bool,
+) -> Result<()> {
+    let target = single_device(discovery, index)?;
+    let rgb = RgbEffects::new(&target.device)?;
+    let status = if let Some(mode) = mode {
+        rgb.set_power_mode(mode)?;
+        "set and read back"
+    } else {
+        "read"
+    };
+    let result = RgbPowerResult {
+        device: target.index,
+        name: target.name.clone(),
+        mode: rgb.power_mode()?,
+        status: status.into(),
+    };
+    if json {
+        print_json(&result)
+    } else {
+        print_table(
+            &["DEVICE", "NAME", "POWER MODE", "STATUS"],
+            &[vec![
+                result.device.to_string(),
+                result.name,
+                result.mode.to_string(),
+                result.status,
+            ]],
+        );
+        Ok(())
+    }
+}
+
+fn rgb_nv_get(discovery: &Discovery, index: Option<usize>, item: u16, json: bool) -> Result<()> {
+    let target = single_device(discovery, index)?;
+    let rgb = RgbEffects::new(&target.device)?;
+    let info = rgb.device_info()?;
+    ensure!(
+        info.nv_caps & item != 0,
+        "NV item 0x{item:04X} is not advertised by device caps 0x{:04X}",
+        info.nv_caps
+    );
+    let value = rgb.get_nv_config(item)?;
+    print_rgb_nv(
+        RgbNvResult {
+            device: target.index,
+            name: target.name.clone(),
+            item,
+            value: hex_bytes(&value),
+            status: "read".into(),
+        },
+        json,
+    )
+}
+
+fn rgb_nv_set(
+    discovery: &Discovery,
+    index: Option<usize>,
+    item: u16,
+    values: &[String],
+    json: bool,
+) -> Result<()> {
+    let target = single_device(discovery, index)?;
+    let rgb = RgbEffects::new(&target.device)?;
+    let info = rgb.device_info()?;
+    ensure!(
+        info.nv_caps & item != 0,
+        "NV item 0x{item:04X} is not advertised by device caps 0x{:04X}",
+        info.nv_caps
+    );
+    let value = parse_seven_hex_bytes(values)?;
+    rgb.set_nv_config(item, value)?;
+    print_rgb_nv(
+        RgbNvResult {
+            device: target.index,
+            name: target.name.clone(),
+            item,
+            value: hex_bytes(&value),
+            status: "set".into(),
+        },
+        json,
+    )
+}
+
+fn perkey_set(
+    discovery: &Discovery,
+    index: Option<usize>,
+    scheme: Option<ZoneScheme>,
+    assignments: &[String],
+    persistent: bool,
+    json: bool,
+) -> Result<()> {
+    let target = single_device(discovery, index)?;
+    let scheme = perkey_scheme(target, scheme)?;
+    let mut keys = Vec::with_capacity(assignments.len());
+    let mut colors = Vec::with_capacity(assignments.len());
+    for assignment in assignments {
+        let (key, color) = assignment
+            .split_once('=')
+            .with_context(|| format!("assignment {assignment:?} must be <key>=RRGGBB"))?;
+        let resolved = resolve_key(key, scheme)?;
+        validate_model_key(target, &resolved)?;
+        colors.push((resolved.zone_id, color.parse::<RgbColor>()?));
+        keys.push(resolved);
+    }
+    prepare_perkey(target)?;
+    let requests = PerKeyLightingV2::new(&target.device)?.write_colors(&colors, persistent)?;
+    print_perkey_result(
+        target,
+        scheme,
+        keys,
+        colors.len(),
+        requests,
+        persistent,
+        json,
+    )
+}
+
+fn perkey_fill(
+    discovery: &Discovery,
+    index: Option<usize>,
+    scheme: Option<ZoneScheme>,
+    color: &str,
+    persistent: bool,
+    json: bool,
+) -> Result<()> {
+    let target = single_device(discovery, index)?;
+    let scheme = perkey_scheme(target, scheme)?;
+    let map = target
+        .model
+        .and_then(|model| model.per_key_map.as_ref())
+        .context(
+            "this device has no embedded per-key usage map; use `perkey set` with explicit keys",
+        )?;
+    let usages = map
+        .entries
+        .keys()
+        .map(|value| {
+            value
+                .parse::<u8>()
+                .with_context(|| format!("invalid HID usage {value:?} in device registry"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let zones = zones_from_usages(usages, scheme)?;
+    let color = color.parse::<RgbColor>()?;
+    let colors = zones
+        .iter()
+        .copied()
+        .map(|zone| (zone, color))
+        .collect::<Vec<_>>();
+    prepare_perkey(target)?;
+    let requests = PerKeyLightingV2::new(&target.device)?.write_colors(&colors, persistent)?;
+    print_perkey_result(
+        target,
+        scheme,
+        Vec::new(),
+        colors.len(),
+        requests,
+        persistent,
+        json,
+    )
+}
+
+fn perkey_frame(
+    discovery: &Discovery,
+    index: Option<usize>,
+    scheme: Option<ZoneScheme>,
+    path: &std::path::Path,
+    persistent: bool,
+    json: bool,
+) -> Result<()> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let frame: std::collections::BTreeMap<String, String> = serde_json::from_slice(&bytes)
+        .with_context(|| {
+            format!(
+                "failed to parse {} as a key-to-color JSON object",
+                path.display()
+            )
+        })?;
+    let assignments = frame
+        .into_iter()
+        .map(|(key, color)| format!("{key}={color}"))
+        .collect::<Vec<_>>();
+    perkey_set(discovery, index, scheme, &assignments, persistent, json)
+}
+
+fn perkey_probe(discovery: &Discovery, index: Option<usize>, json: bool) -> Result<()> {
+    let target = single_device(discovery, index)?;
+    prepare_perkey(target)?;
+    let perkey = PerKeyLightingV2::new(&target.device)?;
+    let probe = probe_zones();
+    perkey.set_individual(&probe)?;
+    perkey.frame_end(false, 0, 0)?;
+
+    let hidusage = "A=red, B=green (D=red/E=green means Solaar instead)";
+    let solaar = "A=blue, B=yellow (D=red/E=green)";
+    eprintln!("HID-usage hypothesis: {hidusage}");
+    eprintln!("Solaar hypothesis: {solaar}");
+    eprint!("Type which keys/colors lit (observation only; no automatic decision): ");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+
+    perkey.set_single_value(RgbColor::BLACK, &[1, 2, 4, 5])?;
+    perkey.frame_end(false, 0, 0)?;
+    let result = PerKeyProbeResult {
+        device: target.index,
+        name: target.name.clone(),
+        hidusage_expected: hidusage.into(),
+        solaar_expected: solaar.into(),
+        answer: answer.trim().into(),
+        status: "observation recorded; probe colors cleared; scheme not selected automatically"
+            .into(),
+    };
+    if json {
+        print_json(&result)
+    } else {
+        print_table(
+            &["DEVICE", "NAME", "OBSERVATION", "STATUS"],
+            &[vec![
+                result.device.to_string(),
+                result.name,
+                result.answer,
+                result.status,
+            ]],
+        );
+        Ok(())
+    }
+}
+
+fn prepare_perkey(target: &ManagedDevice) -> Result<()> {
+    let rgb = RgbEffects::new(&target.device)
+        .context("per-key lighting requires the device's 0x8071 RGB control feature")?;
+    let capabilities = rgb.capabilities()?;
+    let cluster = capabilities
+        .clusters
+        .iter()
+        .filter(|cluster| cluster.effects.iter().any(|effect| effect.id == 0x01))
+        .find(|cluster| cluster.location & 0x0002 != 0)
+        .or_else(|| {
+            capabilities
+                .clusters
+                .iter()
+                .find(|cluster| cluster.effects.iter().any(|effect| effect.id == 0x01))
+        })
+        .context("no RGB cluster supports the fixed effect required for per-key frames")?;
+    let fixed = cluster
+        .effects
+        .iter()
+        .find(|effect| effect.id == 0x01)
+        .context("selected RGB cluster lost its fixed-effect capability")?;
+    let params = encode_effect(
+        Effect::parse("fixed")?,
+        &EffectOptions {
+            color: Some(RgbColor::BLACK),
+            ..Default::default()
+        },
+    )?;
+    rgb.set_sw_control(true, true)?;
+    if let Err(error) = rgb.set_effect(cluster.index, fixed.index, params, Persistence::Ram) {
+        let _ = rgb.set_sw_control(false, false);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn perkey_scheme(target: &ManagedDevice, explicit: Option<ZoneScheme>) -> Result<ZoneScheme> {
+    if let Some(scheme) = explicit {
+        return Ok(scheme);
+    }
+    target
+        .model
+        .and_then(|model| model.per_key_map.as_ref())
+        .and_then(|map| map.zone_scheme.as_deref())
+        .map(str::parse)
+        .transpose()?
+        .context("per-key zone numbering is unresolved for this device; pass --zone-scheme hidusage|solaar or declare zone_scheme in data/devices.json")
+}
+
+fn validate_model_key(target: &ManagedDevice, key: &ResolvedKey) -> Result<()> {
+    let Some(usage) = key.usage else {
+        return Ok(());
+    };
+    let Some(map) = target.model.and_then(|model| model.per_key_map.as_ref()) else {
+        return Ok(());
+    };
+    ensure!(
+        map.entries.contains_key(&usage.to_string()),
+        "key {} (HID usage 0x{usage:02X}) is not present in this device's per-key map",
+        key.name
+    );
+    Ok(())
+}
+
+fn select_rgb_zones(capabilities: &RgbCapabilities, value: &str) -> Result<Vec<u8>> {
+    if value.eq_ignore_ascii_case("all") {
+        return Ok(capabilities
+            .clusters
+            .iter()
+            .map(|cluster| cluster.index)
+            .collect());
+    }
+    let zone = parse_u8_arg(value).map_err(anyhow::Error::msg)?;
+    ensure!(
+        capabilities
+            .clusters
+            .iter()
+            .any(|cluster| cluster.index == zone),
+        "RGB zone {zone} does not exist (valid range: 0..{})",
+        capabilities.device.cluster_count.saturating_sub(1)
+    );
+    Ok(vec![zone])
+}
+
+fn print_rgb_write(result: RgbWriteResult, json: bool) -> Result<()> {
+    if json {
+        print_json(&result)
+    } else {
+        print_table(
+            &["DEVICE", "NAME", "ZONES", "EFFECT", "PERSISTENCE", "STATUS"],
+            &[vec![
+                result.device.to_string(),
+                result.name,
+                result
+                    .zones
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                result.effect,
+                result.persistence,
+                result.status,
+            ]],
+        );
+        Ok(())
+    }
+}
+
+fn print_rgb_nv(result: RgbNvResult, json: bool) -> Result<()> {
+    if json {
+        print_json(&result)
+    } else {
+        print_table(
+            &["DEVICE", "NAME", "ITEM", "VALUE", "STATUS"],
+            &[vec![
+                result.device.to_string(),
+                result.name,
+                format!("0x{:04X}", result.item),
+                result.value,
+                result.status,
+            ]],
+        );
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn print_perkey_result(
+    target: &ManagedDevice,
+    scheme: ZoneScheme,
+    keys: Vec<ResolvedKey>,
+    zone_count: usize,
+    requests: usize,
+    persistent: bool,
+    json: bool,
+) -> Result<()> {
+    let result = PerKeyWriteResult {
+        device: target.index,
+        name: target.name.clone(),
+        zone_scheme: scheme,
+        keys,
+        zone_count,
+        requests,
+        persistent,
+        status: "frame committed".into(),
+    };
+    if json {
+        print_json(&result)
+    } else {
+        print_table(
+            &[
+                "DEVICE",
+                "NAME",
+                "ZONE SCHEME",
+                "ZONES",
+                "REQUESTS",
+                "PERSISTENT",
+                "STATUS",
+            ],
+            &[vec![
+                result.device.to_string(),
+                result.name,
+                result.zone_scheme.to_string(),
+                result.zone_count.to_string(),
+                result.requests.to_string(),
+                result.persistent.to_string(),
+                result.status,
+            ]],
+        );
+        Ok(())
+    }
+}
+
+fn persistence_name(value: Persistence) -> &'static str {
+    match value {
+        Persistence::Ram => "ram",
+        Persistence::Nvm => "nvm",
+        Persistence::PowerSave => "powersave",
+    }
+}
+
+fn parse_seven_hex_bytes(values: &[String]) -> Result<[u8; 7]> {
+    let parts = if values.len() == 1 && values[0].len() == 14 {
+        values[0]
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect::<Vec<_>>()
+    } else {
+        values.to_vec()
+    };
+    ensure!(
+        parts.len() == 7,
+        "NV value must contain exactly 7 hex bytes"
+    );
+    let mut result = [0_u8; 7];
+    for (index, value) in parts.iter().enumerate() {
+        let value = value.strip_prefix("0x").unwrap_or(value);
+        ensure!(
+            value.len() == 2,
+            "NV byte {value:?} must contain two hex digits"
+        );
+        result[index] =
+            u8::from_str_radix(value, 16).with_context(|| format!("invalid NV byte {value:?}"))?;
+    }
+    Ok(result)
 }
 
 fn profile_import_ghub(db: Option<PathBuf>, json: bool) -> Result<()> {
@@ -1251,6 +2273,17 @@ fn parse_u16_arg(value: &str) -> std::result::Result<u16, String> {
         u16::from_str_radix(hex, 16).map_err(|error| error.to_string())
     } else {
         value.parse::<u16>().map_err(|error| error.to_string())
+    }
+}
+
+fn parse_u8_arg(value: &str) -> std::result::Result<u8, String> {
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u8::from_str_radix(hex, 16).map_err(|error| error.to_string())
+    } else {
+        value.parse::<u8>().map_err(|error| error.to_string())
     }
 }
 
