@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::fmt;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -30,6 +31,8 @@ pub enum HidppError {
     Hidpp10 { code: u8, name: &'static str },
     #[error("HID++ 2.0 error {code} ({name})")]
     Hidpp20 { code: u8, name: &'static str },
+    #[error("HID++ software-id 0x{0:X} is also in use")]
+    SwidConflict(u8),
 }
 
 impl HidppError {
@@ -112,8 +115,8 @@ pub fn long_frame(dev_idx: u8, feature_idx: u8, fn_sw: u8, params: &[u8]) -> [u8
     frame
 }
 
-pub const fn fn_sw(function: u8) -> u8 {
-    (function << 4) | 0x01
+pub const fn fn_sw(function: u8, swid: u8) -> u8 {
+    (function << 4) | (swid & 0x0F)
 }
 
 pub fn dpi_from_be(high: u8, low: u8) -> u16 {
@@ -127,6 +130,7 @@ pub fn dpi_to_be(dpi: u16) -> [u8; 2] {
 pub struct HidTransport {
     short: Option<Rc<HidDevice>>,
     long: Option<Rc<HidDevice>>,
+    swid: Cell<SwidState>,
 }
 
 impl HidTransport {
@@ -142,6 +146,7 @@ impl HidTransport {
         Ok(Self {
             short: short.map(Rc::new),
             long: long.map(Rc::new),
+            swid: Cell::new(SwidState::new()),
         })
     }
 
@@ -150,10 +155,19 @@ impl HidTransport {
         Self {
             short: Some(Rc::clone(&device)),
             long: Some(device),
+            swid: Cell::new(SwidState::new()),
         }
     }
 
     pub fn transact(&self, request: &[u8]) -> Result<Packet, HidppError> {
+        self.transact_inner(request, false)
+    }
+
+    pub fn transact_hidpp20(&self, request: &[u8]) -> Result<Packet, HidppError> {
+        self.transact_inner(request, true)
+    }
+
+    fn transact_inner(&self, request: &[u8], hidpp20: bool) -> Result<Packet, HidppError> {
         let write_device = match (request.first(), request.len()) {
             (Some(&REPORT_ID_SHORT), SHORT_LEN) => self
                 .short
@@ -170,15 +184,20 @@ impl HidTransport {
             }
             (None, _) => return Err(HidppError::Malformed("empty request".into())),
         };
+        let mut request = request.to_vec();
 
         for attempt in 0..MAX_ATTEMPTS {
+            if hidpp20 {
+                request[3] = (request[3] & 0xF0) | self.swid.get().current;
+            }
             write_device
-                .write(request)
+                .write(&request)
                 .map_err(|error| HidppError::Io(error.to_string()))?;
 
             let deadline = Instant::now() + READ_TIMEOUT;
             let read_devices = self.read_devices();
             let mut packets_read = 0;
+            let mut swid_conflict = false;
             while Instant::now() < deadline && packets_read < MAX_PACKETS_PER_ATTEMPT {
                 for device in &read_devices {
                     let remaining = deadline.saturating_duration_since(Instant::now());
@@ -199,13 +218,35 @@ impl HidTransport {
                     let Ok(packet) = Packet::new(&buffer[..count]) else {
                         continue;
                     };
-                    match classify_response(request, &packet)? {
+                    let response_match = if hidpp20 {
+                        classify_hidpp20_response(&request, &packet)?
+                    } else {
+                        classify_response(&request, &packet)?
+                    };
+                    match response_match {
                         ResponseMatch::Matched => return Ok(packet),
                         ResponseMatch::Unrelated => continue,
+                        ResponseMatch::SwidConflict => {
+                            swid_conflict = true;
+                            break;
+                        }
                     }
+                }
+                if swid_conflict {
+                    break;
                 }
             }
 
+            if swid_conflict {
+                let conflicted = self.swid.get().current;
+                if attempt + 1 == MAX_ATTEMPTS {
+                    return Err(HidppError::SwidConflict(conflicted));
+                }
+                let mut state = self.swid.get();
+                state.switch();
+                self.swid.set(state);
+                continue;
+            }
             if attempt + 1 == MAX_ATTEMPTS {
                 return Err(HidppError::Timeout(READ_TIMEOUT.as_millis() as u64));
             }
@@ -234,6 +275,43 @@ impl HidTransport {
 enum ResponseMatch {
     Matched,
     Unrelated,
+    SwidConflict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SwidState {
+    current: u8,
+    clock: u64,
+    last_used: [u64; 15],
+}
+
+impl SwidState {
+    fn new() -> Self {
+        let mut state = Self {
+            current: 1,
+            clock: 0,
+            last_used: [0; 15],
+        };
+        state.mark_current();
+        state
+    }
+
+    fn switch(&mut self) {
+        self.current = least_recently_used(&self.last_used, Some(self.current));
+        self.mark_current();
+    }
+
+    fn mark_current(&mut self) {
+        self.clock += 1;
+        self.last_used[usize::from(self.current - 1)] = self.clock;
+    }
+}
+
+fn least_recently_used(last_used: &[u64; 15], exclude: Option<u8>) -> u8 {
+    (1_u8..=15)
+        .filter(|swid| Some(*swid) != exclude)
+        .min_by_key(|swid| (last_used[usize::from(*swid - 1)], *swid))
+        .unwrap()
 }
 
 fn classify_response(request: &[u8], response: &Packet) -> Result<ResponseMatch, HidppError> {
@@ -271,6 +349,63 @@ fn classify_response(request: &[u8], response: &Packet) -> Result<ResponseMatch,
     } else {
         Ok(ResponseMatch::Unrelated)
     }
+}
+
+fn classify_hidpp20_response(
+    request: &[u8],
+    response: &Packet,
+) -> Result<ResponseMatch, HidppError> {
+    let packet = response.as_bytes();
+    if packet[1] == request[1] {
+        // HID++ 1.0 error (0x8F) from the receiver — e.g. "unknown device" while the
+        // wireless device sleeps. Must be surfaced, not treated as unrelated (else timeout).
+        if packet[2] == 0x8F {
+            if packet.len() >= SHORT_LEN && packet[3] == request[2] && packet[4] == request[3] {
+                let code = packet[5];
+                return Err(HidppError::Hidpp10 {
+                    code,
+                    name: hidpp10_error_name(code),
+                });
+            }
+            return Ok(ResponseMatch::Unrelated);
+        }
+        // HID++ 2.0 error: feature/function are echoed after the 0xFF marker.
+        if packet[0] == REPORT_ID_LONG && packet[2] == 0xFF {
+            if packet[3] == request[2] && packet[4] == request[3] {
+                let code = packet[5];
+                return Err(HidppError::Hidpp20 {
+                    code,
+                    name: hidpp20_error_name(code),
+                });
+            }
+        } else if packet[2] == request[2] && packet[3] == request[3] {
+            if is_ping(request) && packet.get(6) != request.get(6) {
+                return Ok(ResponseMatch::SwidConflict);
+            }
+            return Ok(ResponseMatch::Matched);
+        }
+    }
+
+    if response_swid(packet) == Some(request[3] & 0x0F) {
+        Ok(ResponseMatch::SwidConflict)
+    } else {
+        Ok(ResponseMatch::Unrelated)
+    }
+}
+
+fn response_swid(packet: &[u8]) -> Option<u8> {
+    if packet.len() < 4 {
+        return None;
+    }
+    if packet[0] == REPORT_ID_LONG && packet[2] == 0xFF {
+        packet.get(4).map(|value| value & 0x0F)
+    } else {
+        Some(packet[3] & 0x0F)
+    }
+}
+
+fn is_ping(request: &[u8]) -> bool {
+    request.len() >= SHORT_LEN && request[2] == 0 && request[3] >> 4 == 1
 }
 
 fn hidpp10_error_name(code: u8) -> &'static str {
@@ -327,8 +462,8 @@ mod tests {
 
     #[test]
     fn composes_function_and_software_id() {
-        assert_eq!(fn_sw(0), 0x01);
-        assert_eq!(fn_sw(6), 0x61);
+        assert_eq!(fn_sw(0, 1), 0x01);
+        assert_eq!(fn_sw(6, 15), 0x6F);
     }
 
     #[test]
@@ -353,5 +488,63 @@ mod tests {
     fn converts_dpi_big_endian() {
         assert_eq!(dpi_from_be(0x0C, 0x80), 3200);
         assert_eq!(dpi_to_be(3200), [0x0C, 0x80]);
+    }
+
+    #[test]
+    fn selects_software_ids_by_least_recent_use() {
+        let mut state = SwidState::new();
+        assert_eq!(state.current, 1);
+        state.switch();
+        assert_eq!(state.current, 2);
+        state.switch();
+        assert_eq!(state.current, 3);
+
+        let mut used = [5; 15];
+        used[8] = 1;
+        assert_eq!(least_recently_used(&used, None), 9);
+    }
+
+    #[test]
+    fn detects_unexpected_response_with_our_software_id() {
+        let request = long_frame(1, 4, fn_sw(2, 7), &[]);
+        let mut bytes = [0_u8; LONG_LEN];
+        bytes[..4].copy_from_slice(&[REPORT_ID_LONG, 1, 5, fn_sw(3, 7)]);
+        let response = Packet::new(&bytes).unwrap();
+        assert_eq!(
+            classify_hidpp20_response(&request, &response).unwrap(),
+            ResponseMatch::SwidConflict
+        );
+    }
+
+    #[test]
+    fn ignores_unrelated_response_with_another_software_id() {
+        let request = long_frame(1, 4, fn_sw(2, 7), &[]);
+        let mut bytes = [0_u8; LONG_LEN];
+        bytes[..4].copy_from_slice(&[REPORT_ID_LONG, 1, 5, fn_sw(3, 8)]);
+        let response = Packet::new(&bytes).unwrap();
+        assert_eq!(
+            classify_hidpp20_response(&request, &response).unwrap(),
+            ResponseMatch::Unrelated
+        );
+    }
+
+    #[test]
+    fn surfaces_hidpp10_error_on_hidpp20_request() {
+        let request = long_frame(1, 4, fn_sw(2, 7), &[]);
+        let response = Packet::new(&[REPORT_ID_SHORT, 1, 0x8F, 4, fn_sw(2, 7), 8, 0]).unwrap();
+        assert!(matches!(
+            classify_hidpp20_response(&request, &response),
+            Err(HidppError::Hidpp10 { code: 8, .. })
+        ));
+    }
+
+    #[test]
+    fn detects_ping_echo_collision() {
+        let request = short_frame(1, 0, [fn_sw(1, 4), 0, 0, 0xA5]);
+        let response = Packet::new(&[REPORT_ID_SHORT, 1, 0, fn_sw(1, 4), 2, 0, 0x5A]).unwrap();
+        assert_eq!(
+            classify_hidpp20_response(&request, &response).unwrap(),
+            ResponseMatch::SwidConflict
+        );
     }
 }

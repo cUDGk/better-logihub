@@ -24,7 +24,8 @@ G HUB の設定データベースからプロファイル (DPI テーブル・�
 
 | 機能 | コマンド | 対応フィーチャー |
 |---|---|---|
-| デバイス列挙 (レシーバー+ペアリング先) | `logihub list` | HID++ 1.0 レジスタ 0xB5 |
+| デバイス列挙・モデル識別 (レシーバー+ペアリング先) | `logihub list` | HID++ 1.0 レジスタ 0xB5 + 内蔵デバイス表 |
+| モデル情報・ライブ機能一覧 | `logihub device-info --device 3` | 内蔵デバイス表 + 0x0001 |
 | バッテリー残量・充電状態 | `logihub battery` | 0x1004 / 0x1000 |
 | DPI 取得・設定 | `logihub dpi get` / `dpi set 3200` | 0x2202 / 0x2201 |
 | レポートレート取得・設定 | `logihub rate get` / `rate set 1000` | 0x8061 / 0x8060 |
@@ -35,10 +36,13 @@ G HUB の設定データベースからプロファイル (DPI テーブル・�
 | オンボード DPI テーブル / レート | `logihub onboard set-dpi` / `set-rate` | 0x8100 |
 | アクティブ DPI スロット固定 | `logihub onboard set-dpi-index 3` | 0x8100 |
 | オンボードメモリの dump / restore | `logihub onboard dump` / `restore` | 0x8100 |
+| オンボード名の取得・設定 | `logihub onboard get-name` / `set-name` | 0x8100 |
+| セクター CRC 取得・保存済みマクロ実行 | `logihub onboard crc` / `exec-macro` | 0x8100 |
 
 - 全コマンド `--json` で JSON 出力対応
 - Unifying / LIGHTSPEED / Bolt 各レシーバーと有線直結デバイスに対応する設計
 - Windows の HID コレクション分割 (short/long TLC) を正しく処理
+- HID++ 2.0 software id は 1〜15 から選び、他ソフトとの衝突を検出すると自動で切り替え
 
 ## 処理フロー
 
@@ -64,6 +68,10 @@ cargo build --release
 ```bash
 # 接続デバイス一覧
 logihub list
+logihub list --json
+
+# 内蔵モデル情報と、実機が現在広告している HID++ 機能
+logihub device-info --device 3
 
 # バッテリー確認
 logihub battery
@@ -85,13 +93,23 @@ logihub buttons list --device 1
 logihub onboard set-dpi 800 1200 1600 4000 7000 --default 3 --shift 800 --device 1
 logihub onboard set-rate 1000 --device 1
 logihub onboard set-dpi-index 3 --device 1   # 今使うスロットを指定
+
+# 最初の有効プロファイル名と、セクター CRC を読み取る
+logihub onboard get-name --device 1
+logihub onboard crc 1 --device 1             # 0x0101 のような 16 進数も可
+
+# プロファイル名を書き換える (事前 dump 必須)
+logihub onboard set-name "Desktop" --device 1
+
+# 保存済みオンボードマクロを指定位置から実行
+logihub onboard exec-macro 6 0 --device 1
 ```
 
 プロファイルは `%APPDATA%\better-logihub\profiles.json` に保存されます。
 
 ## 制限事項
 
-- ボタン割り当てはオンボードメモリ書き込みで対応 (`buttons set`)。キーストローク・マウスボタン・DPI 操作を割り当て可能。マクロ・ライティングは対象外
+- ボタン割り当てはオンボードメモリ書き込みで対応 (`buttons set`)。キーストローク・マウスボタン・特殊操作・既存マクロ参照を割り当て可能。マクロ作成・ライティングは対象外
 - オンボード書き込みは毎回「事前バックアップ必須 → CRC 検証 → 書き込み → 読み戻し照合」を通ります。壊れたら `onboard restore` で戻せます
 - 電源オフ / スリープ中の無線デバイスは `unreachable` と表示されます (レシーバーの仕様)
 

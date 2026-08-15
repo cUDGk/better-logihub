@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use hidapi::{HidApi, HidDevice};
 use serde::Serialize;
 
+use crate::device_data::{self, DeviceRecord};
 use crate::hidpp::device::Device;
 use crate::hidpp::receiver::Receiver;
 use crate::hidpp::transport::{HidTransport, HidppError};
@@ -23,12 +24,15 @@ pub struct ListRow {
     pub kind: String,
     pub name: String,
     pub wireless_pid: Option<u16>,
+    pub model_id: Option<String>,
+    pub display_name: Option<String>,
     pub status: String,
 }
 
 pub struct ManagedDevice {
     pub index: usize,
     pub name: String,
+    pub model: Option<&'static DeviceRecord>,
     pub device: Device,
 }
 
@@ -62,6 +66,9 @@ pub fn discover() -> Result<Discovery> {
 
     for group in groups {
         let is_receiver = is_receiver_pid(group.product_id);
+        let physical_model = (!is_receiver)
+            .then(|| device_data::lookup(LOGITECH_VENDOR_ID, group.product_id))
+            .flatten();
         let endpoint_name = group.product_name.clone().unwrap_or_else(|| {
             if is_receiver {
                 format!("Logitech receiver {:04X}", group.product_id)
@@ -79,6 +86,8 @@ pub fn discover() -> Result<Discovery> {
                         kind: if is_receiver { "receiver" } else { "direct" }.into(),
                         name: endpoint_name,
                         wireless_pid: None,
+                        model_id: physical_model.map(|model| model.model_id.clone()),
+                        display_name: physical_model.map(|model| model.display_name.clone()),
                         status: format!("open failed: {error}"),
                     });
                     next_index += 1;
@@ -93,6 +102,8 @@ pub fn discover() -> Result<Discovery> {
                 kind: "receiver".into(),
                 name: endpoint_name.clone(),
                 wireless_pid: None,
+                model_id: None,
+                display_name: None,
                 status: channel_status,
             });
             next_index += 1;
@@ -203,6 +214,8 @@ pub fn discover() -> Result<Discovery> {
                 kind: "direct device".into(),
                 name: name.clone(),
                 wireless_pid: None,
+                model_id: physical_model.map(|model| model.model_id.clone()),
+                display_name: physical_model.map(|model| model.display_name.clone()),
                 status: if let Some(error) = probe_error {
                     format!("unreachable: {error}")
                 } else {
@@ -212,6 +225,7 @@ pub fn discover() -> Result<Discovery> {
             devices.push(ManagedDevice {
                 index: next_index,
                 name,
+                model: physical_model,
                 device,
             });
             next_index += 1;
@@ -333,16 +347,20 @@ fn push_wireless_device(
     status: String,
     device: Device,
 ) {
+    let model = wireless_pid.and_then(|pid| device_data::lookup(LOGITECH_VENDOR_ID, pid));
     rows.push(ListRow {
         index: *next_index,
         kind: "wireless device".into(),
         name: name.clone(),
         wireless_pid,
+        model_id: model.map(|model| model.model_id.clone()),
+        display_name: model.map(|model| model.display_name.clone()),
         status,
     });
     devices.push(ManagedDevice {
         index: *next_index,
         name,
+        model,
         device,
     });
     *next_index += 1;

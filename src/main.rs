@@ -1,3 +1,4 @@
+mod device_data;
 mod discovery;
 mod hidpp;
 mod onboard;
@@ -10,13 +11,14 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
+use device_data::DeviceRecord;
 use discovery::{Discovery, ManagedDevice, discover, error_text};
 use hidpp::device::{BatteryStatus, FeatureInfo};
 use onboard::{
     ButtonRow, Description as OnboardDescription, DirectoryEntry, Onboard, backup_path,
-    button_rows, encode_dump, first_enabled_sector, load_dump, parse_binding, require_backup,
-    save_dump, set_button as set_onboard_button, set_dpi as set_onboard_dpi,
-    set_rate as set_onboard_rate,
+    button_rows, encode_dump, first_enabled_sector, load_dump, parse_binding, profile_name,
+    require_backup, save_dump, set_button as set_onboard_button, set_dpi as set_onboard_dpi,
+    set_profile_name, set_rate as set_onboard_rate,
 };
 use output::{print_json, print_table};
 use profile::{
@@ -38,6 +40,11 @@ struct Cli {
 enum Command {
     /// List receivers and paired/direct devices.
     List,
+    /// Show the embedded model record and live HID++ features.
+    DeviceInfo {
+        #[arg(long)]
+        device: Option<usize>,
+    },
     /// Read battery state from one or all devices.
     Battery {
         #[arg(long)]
@@ -127,6 +134,29 @@ enum OnboardCommand {
     Dump {
         #[arg(long)]
         out: PathBuf,
+        #[arg(long)]
+        device: Option<usize>,
+    },
+    GetName {
+        #[arg(long)]
+        device: Option<usize>,
+    },
+    SetName {
+        name: String,
+        #[arg(long)]
+        device: Option<usize>,
+    },
+    Crc {
+        #[arg(value_parser = parse_u16_arg)]
+        sector: u16,
+        #[arg(long)]
+        device: Option<usize>,
+    },
+    ExecMacro {
+        #[arg(value_parser = parse_u16_arg)]
+        sector: u16,
+        #[arg(value_parser = parse_u16_arg)]
+        offset: u16,
         #[arg(long)]
         device: Option<usize>,
     },
@@ -229,6 +259,15 @@ struct FeatureResult {
 }
 
 #[derive(Serialize)]
+struct DeviceInfoResult<'a> {
+    device: usize,
+    name: String,
+    model: Option<&'a DeviceRecord>,
+    features: Option<Vec<FeatureInfo>>,
+    error: Option<String>,
+}
+
+#[derive(Serialize)]
 struct ProfileApplyResult {
     profile: String,
     device: usize,
@@ -243,10 +282,27 @@ struct OnboardInfoResult {
     name: String,
     description: OnboardDescription,
     mode: String,
-    current_profile: u8,
+    current_profile: u16,
     current_dpi_index: u8,
     directory: Vec<DirectoryEntry>,
     directory_raw: String,
+}
+
+#[derive(Serialize)]
+struct OnboardNameResult {
+    device: usize,
+    name: String,
+    sector: u16,
+    profile_name: Option<String>,
+}
+
+#[derive(Serialize)]
+struct OnboardCrcResult {
+    device: usize,
+    name: String,
+    sector: u16,
+    crc: u16,
+    raw: [u8; 16],
 }
 
 #[derive(Serialize)]
@@ -262,6 +318,7 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::List => list(&discover_with_warnings()?, cli.json),
+        Command::DeviceInfo { device } => device_info(&discover_with_warnings()?, device, cli.json),
         Command::Battery { device } => battery(&discover_with_warnings()?, device, cli.json),
         Command::Dpi { command } => {
             let discovery = discover_with_warnings()?;
@@ -286,6 +343,14 @@ fn main() -> Result<()> {
         Command::Onboard { command } => match command {
             OnboardCommand::Info { device } => onboard_info(device, cli.json),
             OnboardCommand::Dump { out, device } => onboard_dump(&out, device, cli.json),
+            OnboardCommand::GetName { device } => onboard_get_name(device, cli.json),
+            OnboardCommand::SetName { name, device } => onboard_set_name(&name, device, cli.json),
+            OnboardCommand::Crc { sector, device } => onboard_crc(sector, device, cli.json),
+            OnboardCommand::ExecMacro {
+                sector,
+                offset,
+                device,
+            } => onboard_exec_macro(sector, offset, device, cli.json),
             OnboardCommand::Restore { input, device } => onboard_restore(&input, device, cli.json),
             OnboardCommand::SetDpi {
                 levels,
@@ -334,11 +399,147 @@ fn list(discovery: &Discovery, json: bool) -> Result<()> {
                 row.wireless_pid
                     .map(|pid| format!("0x{pid:04X}"))
                     .unwrap_or_else(|| "-".into()),
+                row.model_id.clone().unwrap_or_else(|| "-".into()),
+                row.display_name.clone().unwrap_or_else(|| "-".into()),
                 row.status.clone(),
             ]
         })
         .collect::<Vec<_>>();
-    print_table(&["INDEX", "TYPE", "NAME", "WIRELESS PID", "STATUS"], &rows);
+    print_table(
+        &[
+            "INDEX",
+            "TYPE",
+            "NAME",
+            "WIRELESS PID",
+            "MODEL ID",
+            "DISPLAY NAME",
+            "STATUS",
+        ],
+        &rows,
+    );
+    Ok(())
+}
+
+fn device_info(discovery: &Discovery, index: Option<usize>, json: bool) -> Result<()> {
+    let target = single_device(discovery, index)?;
+    let (features, error) = match target.device.features() {
+        Ok(features) => (Some(features), None),
+        Err(error) => (None, Some(error_text(error))),
+    };
+    let result = DeviceInfoResult {
+        device: target.index,
+        name: target.name.clone(),
+        model: target.model,
+        features,
+        error,
+    };
+    if json {
+        return print_json(&result);
+    }
+
+    print_table(
+        &["DEVICE", "NAME", "MODEL ID", "DISPLAY NAME", "TYPE"],
+        &[vec![
+            result.device.to_string(),
+            result.name.clone(),
+            result
+                .model
+                .map(|model| model.model_id.clone())
+                .unwrap_or_else(|| "-".into()),
+            result
+                .model
+                .map(|model| model.display_name.clone())
+                .unwrap_or_else(|| "-".into()),
+            result
+                .model
+                .map(|model| model.kind.clone())
+                .unwrap_or_else(|| "-".into()),
+        ]],
+    );
+    if let Some(model) = result.model {
+        let dpi = model
+            .dpi_default
+            .as_ref()
+            .map(|dpi| {
+                format!(
+                    "levels={:?}, default={}, shift={}",
+                    dpi.levels, dpi.default, dpi.shift
+                )
+            })
+            .unwrap_or_else(|| "-".into());
+        let rows = vec![
+            vec!["pids".into(), model.pids.join(", ")],
+            vec![
+                "slot_prefix".into(),
+                model.slot_prefix.clone().unwrap_or_else(|| "-".into()),
+            ],
+            vec![
+                "lighting.category".into(),
+                model
+                    .lighting
+                    .category
+                    .clone()
+                    .unwrap_or_else(|| "-".into()),
+            ],
+            vec![
+                "lighting.per_key".into(),
+                model.lighting.per_key.to_string(),
+            ],
+            vec![
+                "lighting.persistence".into(),
+                serde_json::to_string(&model.lighting.persistence)?,
+            ],
+            vec!["input.categories".into(), model.input.categories.join(", ")],
+            vec!["input.layers".into(), model.input.layers.join(", ")],
+            vec![
+                "gkeys.count".into(),
+                model
+                    .gkeys
+                    .count
+                    .map(|count| count.to_string())
+                    .unwrap_or_else(|| "-".into()),
+            ],
+            vec![
+                "onboard.supported".into(),
+                model.onboard.supported.to_string(),
+            ],
+            vec!["dpi_default".into(), dpi],
+            vec![
+                "per_key_map".into(),
+                model
+                    .per_key_map
+                    .as_ref()
+                    .map(|map| format!("{} HID usages", map.len()))
+                    .unwrap_or_else(|| "-".into()),
+            ],
+        ];
+        print_table(&["MODEL FIELD", "VALUE"], &rows);
+        let zones = model
+            .lighting
+            .zones
+            .iter()
+            .map(|zone| vec![zone.zone_type.clone(), zone.effects.join(", ")])
+            .collect::<Vec<_>>();
+        print_table(&["LIGHTING ZONE", "EFFECTS"], &zones);
+    } else {
+        println!("MODEL RECORD: unknown PID");
+    }
+    let rows = result
+        .features
+        .unwrap_or_default()
+        .into_iter()
+        .map(|feature| {
+            vec![
+                feature.index.to_string(),
+                format!("0x{:04X}", feature.id),
+                feature.name.into(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    print_table(&["INDEX", "ID", "FEATURE"], &rows);
+    if let Some(error) = result.error {
+        eprintln!("feature read failed: {error}");
+    }
     Ok(())
 }
 
@@ -675,7 +876,7 @@ fn onboard_info(index: Option<usize>, json: bool) -> Result<()> {
             format!("0x{:02X}", result.description.profile_format_id),
             format!("0x{:02X}", result.description.macro_format_id),
             result.description.sector_size.to_string(),
-            result.current_profile.to_string(),
+            format!("0x{:04X}", result.current_profile),
             result.current_dpi_index.to_string(),
         ]],
     );
@@ -715,6 +916,102 @@ fn onboard_dump(out: &std::path::Path, index: Option<usize>, json: bool) -> Resu
         status: "saved and registered as safety backup".into(),
     };
     print_onboard_result(result, json)
+}
+
+fn onboard_get_name(index: Option<usize>, json: bool) -> Result<()> {
+    let discovery = discover_with_warnings()?;
+    let target = single_device(&discovery, index)?;
+    let onboard = Onboard::new(&target.device)?;
+    let description = onboard.description()?;
+    let (_, entries) = onboard.directory(&description)?;
+    let sector_id = first_enabled_sector(&entries)?;
+    let sector = onboard.read_sector(sector_id, description.sector_size)?;
+    let result = OnboardNameResult {
+        device: target.index,
+        name: target.name.clone(),
+        sector: sector_id,
+        profile_name: profile_name(&sector)?,
+    };
+    if json {
+        return print_json(&result);
+    }
+    print_table(
+        &["DEVICE", "NAME", "SECTOR", "PROFILE NAME"],
+        &[vec![
+            result.device.to_string(),
+            result.name,
+            format!("0x{:04X}", result.sector),
+            result.profile_name.unwrap_or_else(|| "-".into()),
+        ]],
+    );
+    Ok(())
+}
+
+fn onboard_set_name(name: &str, index: Option<usize>, json: bool) -> Result<()> {
+    let discovery = discover_with_warnings()?;
+    let target = single_device(&discovery, index)?;
+    let onboard = Onboard::new(&target.device)?;
+    let description = onboard.description()?;
+    require_backup(&description)?;
+    let (_, entries) = onboard.directory(&description)?;
+    let sector_id = first_enabled_sector(&entries)?;
+    let original = onboard.read_sector(sector_id, description.sector_size)?;
+    let mut replacement = original.clone();
+    set_profile_name(&mut replacement, name)?;
+    onboard.write_sector_verified(sector_id, &original, &replacement, false)?;
+    print_onboard_result(
+        OnboardWriteResult {
+            device: target.index,
+            name: target.name.clone(),
+            operation: format!("set profile name in sector 0x{sector_id:04X}"),
+            status: "verified".into(),
+        },
+        json,
+    )
+}
+
+fn onboard_crc(sector: u16, index: Option<usize>, json: bool) -> Result<()> {
+    let discovery = discover_with_warnings()?;
+    let target = single_device(&discovery, index)?;
+    let onboard = Onboard::new(&target.device)?;
+    let response = onboard.get_crc(sector)?;
+    let result = OnboardCrcResult {
+        device: target.index,
+        name: target.name.clone(),
+        sector,
+        crc: response.crc,
+        raw: response.raw,
+    };
+    if json {
+        return print_json(&result);
+    }
+    print_table(
+        &["DEVICE", "NAME", "SECTOR", "CRC", "RAW"],
+        &[vec![
+            result.device.to_string(),
+            result.name,
+            format!("0x{:04X}", result.sector),
+            format!("0x{:04X}", result.crc),
+            hex_bytes(&result.raw),
+        ]],
+    );
+    Ok(())
+}
+
+fn onboard_exec_macro(sector: u16, offset: u16, index: Option<usize>, json: bool) -> Result<()> {
+    let discovery = discover_with_warnings()?;
+    let target = single_device(&discovery, index)?;
+    let onboard = Onboard::new(&target.device)?;
+    onboard.execute_macro(sector, offset)?;
+    print_onboard_result(
+        OnboardWriteResult {
+            device: target.index,
+            name: target.name.clone(),
+            operation: format!("execute macro at 0x{sector:04X}:0x{offset:04X}"),
+            status: "executed".into(),
+        },
+        json,
+    )
 }
 
 fn onboard_restore(input: &std::path::Path, index: Option<usize>, json: bool) -> Result<()> {
@@ -782,7 +1079,13 @@ fn buttons_set(
     let sector_id = first_enabled_sector(&entries)?;
     let original = onboard.read_sector(sector_id, description.sector_size)?;
     let mut replacement = original.clone();
-    set_onboard_button(&mut replacement, number, gshift, &binding)?;
+    set_onboard_button(
+        &mut replacement,
+        number,
+        gshift,
+        &binding,
+        description.button_count,
+    )?;
     onboard.write_sector_verified(sector_id, &original, &replacement, false)?;
     print_onboard_result(
         OnboardWriteResult {
@@ -862,7 +1165,7 @@ fn onboard_set_rate(hz: u32, index: Option<usize>, json: bool) -> Result<()> {
     let sector_id = first_enabled_sector(&entries)?;
     let original = onboard.read_sector(sector_id, description.sector_size)?;
     let mut replacement = original.clone();
-    set_onboard_rate(&mut replacement, hz)?;
+    set_onboard_rate(&mut replacement, hz, description.profile_format_id)?;
     onboard.write_sector_verified(sector_id, &original, &replacement, false)?;
     print_onboard_result(
         OnboardWriteResult {
@@ -938,6 +1241,17 @@ fn hex_bytes(data: &[u8]) -> String {
         .map(|byte| format!("{byte:02X}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn parse_u16_arg(value: &str) -> std::result::Result<u16, String> {
+    if let Some(hex) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u16::from_str_radix(hex, 16).map_err(|error| error.to_string())
+    } else {
+        value.parse::<u16>().map_err(|error| error.to_string())
+    }
 }
 
 fn print_value_results<T>(results: &[ValueResult<T>], label: &str, json: bool) -> Result<()>

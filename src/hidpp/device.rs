@@ -196,8 +196,8 @@ impl Device {
         function: u8,
         params: &[u8],
     ) -> Result<[u8; 16], HidppError> {
-        let request = long_frame(self.dev_idx, feature_idx, fn_sw(function), params);
-        let response = self.transport.transact(&request)?;
+        let request = long_frame(self.dev_idx, feature_idx, fn_sw(function, 0), params);
+        let response = self.transport.transact_hidpp20(&request)?;
         let mut result = [0_u8; 16];
         result.copy_from_slice(response.params());
         Ok(result)
@@ -216,10 +216,10 @@ impl Device {
             )));
         }
         let mut short_params = [0_u8; 4];
-        short_params[0] = fn_sw(function);
+        short_params[0] = fn_sw(function, 0);
         short_params[1..1 + params.len()].copy_from_slice(params);
         let request = short_frame(self.dev_idx, feature_idx, short_params);
-        let response = self.transport.transact(&request)?;
+        let response = self.transport.transact_hidpp20(&request)?;
         Ok(response.params().to_vec())
     }
 }
@@ -281,22 +281,47 @@ pub fn feature_name(id: u16) -> &'static str {
         0x0001 => "IFeatureSet",
         0x0003 => "IFirmwareInfo",
         0x0005 => "DeviceName",
+        0x0007 => "DeviceFriendlyName",
+        0x0020 => "ConfigChange",
+        0x0620 => "RgbHostMode",
+        0x0621 => "RgbOnboardEffects",
+        0x0635 => "RgbStreaming",
         0x1000 => "BatteryLevelStatus",
         0x1001 => "BatteryVoltage",
         0x1004 => "UnifiedBattery",
         0x1802 => "DeviceReset",
-        0x1B04 => "WirelessDeviceStatus",
+        0x1814 => "ChangeHost",
+        0x1815 => "HostsInfo",
+        0x1830 => "PowerModes",
+        0x18A1 => "LedState",
+        0x1982 => "Backlight",
+        0x1983 => "KeyboardBacklight",
+        0x1B04 => "SpecialKeys",
+        0x1B05 => "FullKeyCustomization",
+        0x1B10 => "ControlList",
+        0x1BC0 => "ReportHidUsages",
+        0x1C00 => "PersistentRemappableAction",
+        0x1D4B => "WirelessDeviceStatus",
         0x1DF3 => "EquadDjDebugInfo",
         0x1E00 => "EnableHiddenFeatures",
         0x1F03 => "DeviceFriendlyName",
         0x2200 => "MousePointer",
         0x2201 => "AdjustableDPI",
         0x2202 => "ExtendedAdjustableDPI",
+        0x4100 => "Encryption",
+        0x4522 => "DisableKeysByUsage",
+        0x4540 => "KeyboardLayout",
+        0x8010 => "GKeys",
+        0x8020 => "MKeys",
+        0x8030 => "MacroRecordKey",
+        0x8040 => "BrightnessControl",
+        0x8051 => "LogiModifiers",
         0x8060 => "ReportRate",
-        0x8061 => "ExtendedReportRate",
+        0x8061 => "ExtendedAdjustableReportRate",
         0x8070 => "ColorLedEffects",
         0x8071 => "RgbEffects",
         0x8080 => "PerKeyLighting",
+        0x8081 => "PerKeyLightingV2",
         0x8100 => "OnboardProfiles",
         _ => "Unknown",
     }
@@ -320,5 +345,46 @@ mod tests {
         assert_eq!(unified_battery_status_name(2), "charging_slow");
         assert_eq!(unified_battery_status_name(3), "full");
         assert_eq!(unified_battery_status_name(4), "error");
+    }
+
+    #[test]
+    fn names_phase_a_features() {
+        for (id, name) in [
+            (0x0007, "DeviceFriendlyName"),
+            (0x0020, "ConfigChange"),
+            (0x0620, "RgbHostMode"),
+            (0x0621, "RgbOnboardEffects"),
+            (0x0635, "RgbStreaming"),
+            (0x1802, "DeviceReset"),
+            (0x1814, "ChangeHost"),
+            (0x1815, "HostsInfo"),
+            (0x1830, "PowerModes"),
+            (0x18A1, "LedState"),
+            (0x1982, "Backlight"),
+            (0x1983, "KeyboardBacklight"),
+            (0x1B04, "SpecialKeys"),
+            (0x1B05, "FullKeyCustomization"),
+            (0x1B10, "ControlList"),
+            (0x1BC0, "ReportHidUsages"),
+            (0x1C00, "PersistentRemappableAction"),
+            (0x1D4B, "WirelessDeviceStatus"),
+            (0x1E00, "EnableHiddenFeatures"),
+            (0x2202, "ExtendedAdjustableDPI"),
+            (0x4100, "Encryption"),
+            (0x4522, "DisableKeysByUsage"),
+            (0x4540, "KeyboardLayout"),
+            (0x8010, "GKeys"),
+            (0x8020, "MKeys"),
+            (0x8030, "MacroRecordKey"),
+            (0x8040, "BrightnessControl"),
+            (0x8051, "LogiModifiers"),
+            (0x8061, "ExtendedAdjustableReportRate"),
+            (0x8070, "ColorLedEffects"),
+            (0x8071, "RgbEffects"),
+            (0x8080, "PerKeyLighting"),
+            (0x8081, "PerKeyLightingV2"),
+        ] {
+            assert_eq!(feature_name(id), name);
+        }
     }
 }

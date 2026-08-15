@@ -13,6 +13,8 @@ const FEATURE_ONBOARD_PROFILES: u16 = 0x8100;
 const BUTTONS_OFFSET: usize = 32;
 const GSHIFT_BUTTONS_OFFSET: usize = 96;
 const BUTTON_COUNT: usize = 16;
+const PROFILE_NAME_OFFSET: usize = 0xA0;
+const PROFILE_NAME_UNITS: usize = 24;
 const MIN_PROFILE_SECTOR_SIZE: usize = GSHIFT_BUTTONS_OFFSET + BUTTON_COUNT * 4 + 2;
 const DUMP_MAGIC: &[u8; 8] = b"BLHOB001";
 
@@ -50,22 +52,36 @@ impl Description {
         Ok(description)
     }
 
-    fn validate(&self) -> Result<()> {
+    fn parse_response(response: &[u8]) -> Result<Self> {
         ensure!(
-            self.memory_model_id == 0x01,
-            "unsupported memory model 0x{:02X}",
-            self.memory_model_id
+            response.len() >= 10,
+            "getDescription returned only {} bytes",
+            response.len()
         );
+        let mut raw = [0_u8; 16];
+        let count = response.len().min(raw.len());
+        raw[..count].copy_from_slice(&response[..count]);
+        Self::parse(raw)
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.memory_model_id != 0x01 {
+            eprintln!(
+                "warning: unrecognized onboard memory model 0x{:02X}",
+                self.memory_model_id
+            );
+        }
         ensure!(
             matches!(self.profile_format_id, 0x01..=0x05),
             "unsupported profile format 0x{:02X}",
             self.profile_format_id
         );
-        ensure!(
-            self.macro_format_id == 0x01,
-            "unsupported macro format 0x{:02X}",
-            self.macro_format_id
-        );
+        if self.macro_format_id != 0x01 {
+            eprintln!(
+                "warning: unrecognized onboard macro format 0x{:02X}",
+                self.macro_format_id
+            );
+        }
         let size = usize::from(self.sector_size);
         ensure!(
             (MIN_PROFILE_SECTOR_SIZE..=4096).contains(&size),
@@ -88,6 +104,7 @@ pub struct DirectoryEntry {
 pub enum Binding {
     Mouse(u8),
     Key { modifiers: u8, usage: u8 },
+    Macro { sector: u16, offset: u16 },
     Special(u8),
     Disabled,
     Other([u8; 4]),
@@ -103,6 +120,11 @@ impl Binding {
                 Ok([0x80, 0x01, high, low])
             }
             Self::Key { modifiers, usage } => Ok([0x80, 0x02, *modifiers, *usage]),
+            Self::Macro { sector, offset } => {
+                let [sector_high, sector_low] = sector.to_be_bytes();
+                let [offset_high, offset_low] = offset.to_be_bytes();
+                Ok([sector_high, sector_low, offset_high, offset_low])
+            }
             Self::Special(code) => Ok([0x90, *code, 0, 0]),
             Self::Disabled => Ok([0xFF, 0, 0, 0]),
             Self::Other(raw) => Ok(*raw),
@@ -124,6 +146,10 @@ impl Binding {
                 modifiers: raw[2],
                 usage: raw[3],
             },
+            (0x00, _) => Self::Macro {
+                sector: u16::from_be_bytes([raw[0], raw[1]]),
+                offset: u16::from_be_bytes([raw[2], raw[3]]),
+            },
             (0x90, _) => Self::Special(raw[1]),
             (0xFF, _) => Self::Disabled,
             _ => Self::Other(raw),
@@ -137,6 +163,9 @@ impl fmt::Display for Binding {
             Self::Mouse(button) => write!(f, "mouse:{}", mouse_button_name(*button)),
             Self::Key { modifiers, usage } => {
                 write!(f, "key:{}", format_key_combo(*modifiers, *usage))
+            }
+            Self::Macro { sector, offset } => {
+                write!(f, "macro:0x{sector:04X}:0x{offset:04X}")
             }
             Self::Special(code) => write!(f, "{}", special_name(*code)),
             Self::Disabled => write!(f, "disabled"),
@@ -155,6 +184,12 @@ pub struct ButtonRow {
     pub gshift: bool,
     pub binding: String,
     pub raw: String,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CrcResponse {
+    pub raw: [u8; 16],
+    pub crc: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -181,14 +216,7 @@ impl<'a> Onboard<'a> {
             .device
             .call_short(self.feature, 0, &[])
             .map_err(anyhow::Error::new)?;
-        ensure!(
-            response.len() >= 16,
-            "getDescription returned only {} bytes",
-            response.len()
-        );
-        let mut raw = [0_u8; 16];
-        raw.copy_from_slice(&response[..16]);
-        Description::parse(raw)
+        Description::parse_response(&response)
     }
 
     pub fn mode(&self) -> Result<u8> {
@@ -238,16 +266,27 @@ impl<'a> Onboard<'a> {
         Ok(())
     }
 
-    // libratbag: fn 0x4, response params[1] = active profile index (1-based)
-    pub fn current_profile(&self) -> Result<u8> {
+    pub fn current_profile(&self) -> Result<u16> {
         let response = self
             .device
             .call_short(self.feature, 0x04, &[])
             .map_err(anyhow::Error::new)?;
-        response
-            .get(1)
-            .copied()
-            .context("getCurrentProfile returned no data")
+        parse_current_profile(&response)
+    }
+
+    pub fn get_crc(&self, sector: u16) -> Result<CrcResponse> {
+        let raw = self
+            .device
+            .call_long(self.feature, 10, &crc_request(sector))
+            .map_err(anyhow::Error::new)?;
+        Ok(parse_crc_response(raw))
+    }
+
+    pub fn execute_macro(&self, sector: u16, offset: u16) -> Result<()> {
+        self.device
+            .call_long(self.feature, 9, &execute_macro_request(sector, offset))
+            .map_err(anyhow::Error::new)?;
+        Ok(())
     }
 
     pub fn read_sector(&self, sector: u16, size: u16) -> Result<Vec<u8>> {
@@ -364,28 +403,61 @@ impl<'a> Onboard<'a> {
 
 pub fn parse_directory(data: &[u8], profile_count: u8) -> Result<Vec<DirectoryEntry>> {
     ensure!(sector_crc_valid(data), "profile directory CRC is invalid");
+    let count = usize::from(profile_count);
+    let terminator_offset = count * 4;
+    ensure!(
+        terminator_offset + 2 <= data.len() - 2,
+        "profile directory is truncated"
+    );
     let mut entries = Vec::new();
-    for index in 0..usize::from(profile_count) {
+    for index in 0..count {
         let offset = index * 4;
         ensure!(
-            offset + 4 <= data.len() - 2,
-            "profile directory is truncated"
+            data[offset] == 0 && (1..=profile_count).contains(&data[offset + 1]),
+            "profile directory entry {} has invalid sector 0x{:02X}{:02X}",
+            index + 1,
+            data[offset],
+            data[offset + 1]
         );
-        let sector = u16::from_be_bytes([data[offset], data[offset + 1]]);
-        if sector == 0xFFFF {
-            break;
-        }
-        ensure!(
-            sector != 0,
-            "profile directory points a profile at sector 0"
-        );
+        let sector = u16::from(data[offset + 1]);
         entries.push(DirectoryEntry {
             index: index + 1,
             sector,
             enabled: data[offset + 2] != 0,
         });
     }
+    ensure!(
+        data[terminator_offset..terminator_offset + 2] == [0xFF, 0xFF],
+        "profile directory has no 0xFFFF terminator at index {count}"
+    );
     Ok(entries)
+}
+
+fn parse_current_profile(response: &[u8]) -> Result<u16> {
+    ensure!(
+        response.len() >= 2,
+        "getCurrentProfile returned only {} bytes",
+        response.len()
+    );
+    Ok(u16::from_be_bytes([response[0], response[1]]))
+}
+
+fn parse_crc_response(raw: [u8; 16]) -> CrcResponse {
+    CrcResponse {
+        crc: u16::from_be_bytes([raw[0], raw[1]]),
+        raw,
+    }
+}
+
+fn crc_request(sector: u16) -> [u8; 2] {
+    sector.to_be_bytes()
+}
+
+fn execute_macro_request(sector: u16, offset: u16) -> [u8; 4] {
+    let mut request = [0_u8; 4];
+    request[..2].copy_from_slice(&sector.to_be_bytes());
+    request[2..].copy_from_slice(&offset.to_be_bytes());
+    request
 }
 
 pub fn first_enabled_sector(entries: &[DirectoryEntry]) -> Result<u16> {
@@ -414,11 +486,18 @@ pub fn button_rows(sector: &[u8]) -> Result<Vec<ButtonRow>> {
     Ok(rows)
 }
 
-pub fn set_button(sector: &mut [u8], number: usize, gshift: bool, binding: &Binding) -> Result<()> {
+pub fn set_button(
+    sector: &mut [u8],
+    number: usize,
+    gshift: bool,
+    binding: &Binding,
+    button_count: u8,
+) -> Result<()> {
     validate_profile_sector(sector)?;
+    let count = BUTTON_COUNT.min(usize::from(button_count));
     ensure!(
-        (1..=BUTTON_COUNT).contains(&number),
-        "button number must be 1..=16"
+        (1..=count).contains(&number),
+        "button number must be 1..={count}"
     );
     let base = if gshift {
         GSHIFT_BUTTONS_OFFSET
@@ -463,8 +542,12 @@ pub fn set_dpi(
     update_sector_crc(sector)
 }
 
-pub fn set_rate(sector: &mut [u8], hz: u32) -> Result<()> {
+pub fn set_rate(sector: &mut [u8], hz: u32, profile_format_id: u8) -> Result<()> {
     validate_profile_sector(sector)?;
+    ensure!(
+        matches!(profile_format_id, 1..=5),
+        "report-rate editing requires onboard layout A"
+    );
     ensure!(
         hz != 0 && 1000 % hz == 0,
         "onboard report rate must divide 1000 Hz exactly"
@@ -475,6 +558,45 @@ pub fn set_rate(sector: &mut [u8], hz: u32) -> Result<()> {
         "report rate is outside the onboard format range"
     );
     sector[0] = interval as u8;
+    update_sector_crc(sector)
+}
+
+pub fn profile_name(sector: &[u8]) -> Result<Option<String>> {
+    validate_profile_sector(sector)?;
+    ensure!(
+        sector.len() >= PROFILE_NAME_OFFSET + PROFILE_NAME_UNITS * 2 + 2,
+        "profile sector is too short for a layout-A name"
+    );
+    let bytes = &sector[PROFILE_NAME_OFFSET..PROFILE_NAME_OFFSET + PROFILE_NAME_UNITS * 2];
+    if bytes.iter().all(|byte| *byte == 0xFF) {
+        return Ok(None);
+    }
+    let units = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .take_while(|unit| !matches!(unit, 0 | 0xFFFF))
+        .collect::<Vec<_>>();
+    String::from_utf16(&units)
+        .map(Some)
+        .context("profile name is not valid UTF-16LE")
+}
+
+pub fn set_profile_name(sector: &mut [u8], name: &str) -> Result<()> {
+    validate_profile_sector(sector)?;
+    ensure!(
+        sector.len() >= PROFILE_NAME_OFFSET + PROFILE_NAME_UNITS * 2 + 2,
+        "profile sector is too short for a layout-A name"
+    );
+    let units = name.encode_utf16().collect::<Vec<_>>();
+    ensure!(
+        units.len() <= PROFILE_NAME_UNITS,
+        "profile name must be at most {PROFILE_NAME_UNITS} UTF-16 code units"
+    );
+    let bytes = &mut sector[PROFILE_NAME_OFFSET..PROFILE_NAME_OFFSET + PROFILE_NAME_UNITS * 2];
+    bytes.fill(0xFF);
+    for (index, unit) in units.into_iter().enumerate() {
+        bytes[index * 2..index * 2 + 2].copy_from_slice(&unit.to_le_bytes());
+    }
     update_sector_crc(sector)
 }
 
@@ -492,7 +614,7 @@ fn write_chunks(data: &[u8]) -> Vec<[u8; 16]> {
     // meaningful bytes, so a partial final frame is padding only.
     data.chunks(16)
         .map(|chunk| {
-            let mut frame = [0_u8; 16];
+            let mut frame = [0xFF_u8; 16];
             frame[..chunk.len()].copy_from_slice(chunk);
             frame
         })
@@ -550,14 +672,45 @@ pub fn parse_binding(value: &str) -> Result<Binding> {
         let (modifiers, usage) = parse_key_combo(combo)?;
         return Ok(Binding::Key { modifiers, usage });
     }
+    if let Some(value) = lower.strip_prefix("macro:") {
+        let (sector, offset) = value
+            .split_once(':')
+            .context("macro binding must be macro:<sector>:<offset>")?;
+        return Ok(Binding::Macro {
+            sector: parse_u16(sector)?,
+            offset: parse_u16(offset)?,
+        });
+    }
     let special = match lower.as_str() {
-        "dpi-up" => 0x03,
-        "dpi-down" => 0x04,
-        "dpi-cycle" => 0x05,
-        "dpi-shift" => 0x07,
+        "noop" => 0x00,
+        "tilt-left" => 0x01,
+        "tilt-right" => 0x02,
+        "next-dpi" | "dpi-up" => 0x03,
+        "prev-dpi" | "dpi-down" => 0x04,
+        "cycle-dpi" | "dpi-cycle" => 0x05,
+        "default-dpi" | "dpi-default" => 0x06,
+        "shift-dpi" | "dpi-shift" => 0x07,
+        "next-profile" | "profile-next" => 0x08,
+        "prev-profile" | "profile-prev" => 0x09,
+        "cycle-profile" | "profile-cycle" => 0x0A,
+        "g-shift" => 0x0B,
+        "battery-indicator" => 0x0C,
+        "scroll-down" => 0x10,
+        "scroll-up" => 0x11,
+        "wheel-mode-toggle" => 0x1C,
+        "ratchet-force-cycle" => 0x1D,
         _ => bail!("invalid binding {value:?}"),
     };
     Ok(Binding::Special(special))
+}
+
+fn parse_u16(value: &str) -> Result<u16> {
+    let result = if let Some(hex) = value.strip_prefix("0x") {
+        u16::from_str_radix(hex, 16)
+    } else {
+        value.parse()
+    };
+    result.with_context(|| format!("invalid 16-bit value {value:?}"))
 }
 
 pub fn parse_key_combo(combo: &str) -> Result<(u8, u8)> {
@@ -695,10 +848,23 @@ fn mouse_button_name(button: u8) -> String {
 
 fn special_name(code: u8) -> String {
     match code {
-        0x03 => "dpi-up".into(),
-        0x04 => "dpi-down".into(),
-        0x05 => "dpi-cycle".into(),
-        0x07 => "dpi-shift".into(),
+        0x00 => "noop".into(),
+        0x01 => "tilt-left".into(),
+        0x02 => "tilt-right".into(),
+        0x03 => "next-dpi".into(),
+        0x04 => "prev-dpi".into(),
+        0x05 => "cycle-dpi".into(),
+        0x06 => "default-dpi".into(),
+        0x07 => "shift-dpi".into(),
+        0x08 => "next-profile".into(),
+        0x09 => "prev-profile".into(),
+        0x0A => "cycle-profile".into(),
+        0x0B => "g-shift".into(),
+        0x0C => "battery-indicator".into(),
+        0x10 => "scroll-down".into(),
+        0x11 => "scroll-up".into(),
+        0x1C => "wheel-mode-toggle".into(),
+        0x1D => "ratchet-force-cycle".into(),
         _ => format!("special:0x{code:02X}"),
     }
 }
@@ -822,6 +988,10 @@ mod tests {
                 modifiers: 3,
                 usage: 0x06,
             },
+            Binding::Macro {
+                sector: 0x002A,
+                offset: 0x1234,
+            },
             Binding::Special(7),
             Binding::Disabled,
         ] {
@@ -837,6 +1007,32 @@ mod tests {
         let description = Description::parse(raw).unwrap();
         assert_eq!(description.sector_size, 255);
         assert_eq!(description.button_count, 11);
+    }
+
+    #[test]
+    fn accepts_ten_byte_description_and_warns_on_unknown_models() {
+        let response = [0x22, 0x04, 0x33, 5, 2, 11, 16, 0, 0xFF, 0x0A];
+        let description = Description::parse_response(&response).unwrap();
+        assert_eq!(description.memory_model_id, 0x22);
+        assert_eq!(description.macro_format_id, 0x33);
+        assert_eq!(description.sector_size, 255);
+        assert_eq!(&description.raw[..10], &response);
+        assert!(description.raw[10..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn parses_rom_profile_and_crc_response_as_big_endian() {
+        assert_eq!(parse_current_profile(&[0x01, 0x03]).unwrap(), 0x0103);
+        assert_eq!(crc_request(0x1234), [0x12, 0x34]);
+        assert_eq!(
+            execute_macro_request(0x1234, 0xABCD),
+            [0x12, 0x34, 0xAB, 0xCD]
+        );
+        let mut raw = [0_u8; 16];
+        raw[..4].copy_from_slice(&[0xAB, 0xCD, 0x12, 0x34]);
+        let response = parse_crc_response(raw);
+        assert_eq!(response.crc, 0xABCD);
+        assert_eq!(response.raw, raw);
     }
 
     #[test]
@@ -867,6 +1063,7 @@ mod tests {
                 modifiers: 1,
                 usage: 0x06,
             },
+            11,
         )
         .unwrap();
         assert_eq!(&sector[36..40], &[0x80, 0x02, 0x01, 0x06]);
@@ -878,13 +1075,107 @@ mod tests {
     }
 
     #[test]
+    fn clamps_writable_buttons_to_device_count() {
+        let mut sector = vec![0xFF; 255];
+        update_sector_crc(&mut sector).unwrap();
+        assert!(set_button(&mut sector, 11, false, &Binding::Disabled, 11).is_ok());
+        assert!(set_button(&mut sector, 12, false, &Binding::Disabled, 11).is_err());
+        assert!(set_button(&mut sector, 1, false, &Binding::Disabled, 0).is_err());
+    }
+
+    #[test]
     fn splits_255_byte_write_into_16_padded_frames() {
         let data = (0..255).map(|value| value as u8).collect::<Vec<_>>();
         let chunks = write_chunks(&data);
         assert_eq!(chunks.len(), 16);
         assert_eq!(&chunks[0], &data[..16]);
         assert_eq!(&chunks[15][..15], &data[240..255]);
-        assert_eq!(chunks[15][15], 0);
+        assert_eq!(chunks[15][15], 0xFF);
+    }
+
+    #[test]
+    fn validates_complete_directory_layout() {
+        let mut directory = vec![0xFF; 255];
+        directory[..22].copy_from_slice(&[
+            0, 1, 1, 0, 0, 2, 1, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0xFF, 0xFF,
+        ]);
+        update_sector_crc(&mut directory).unwrap();
+        assert_eq!(parse_directory(&directory, 5).unwrap().len(), 5);
+
+        let mut bad_high = directory.clone();
+        bad_high[0] = 1;
+        update_sector_crc(&mut bad_high).unwrap();
+        assert!(parse_directory(&bad_high, 5).is_err());
+
+        let mut bad_low = directory.clone();
+        bad_low[1] = 6;
+        update_sector_crc(&mut bad_low).unwrap();
+        assert!(parse_directory(&bad_low, 5).is_err());
+
+        let mut bad_terminator = directory.clone();
+        bad_terminator[20] = 0;
+        update_sector_crc(&mut bad_terminator).unwrap();
+        assert!(parse_directory(&bad_terminator, 5).is_err());
+    }
+
+    #[test]
+    fn profile_name_is_utf16le_and_ff_means_unnamed() {
+        let mut sector = vec![0xFF; 255];
+        update_sector_crc(&mut sector).unwrap();
+        assert_eq!(profile_name(&sector).unwrap(), None);
+
+        set_profile_name(&mut sector, "日本語").unwrap();
+        assert_eq!(profile_name(&sector).unwrap().as_deref(), Some("日本語"));
+        assert_eq!(
+            &sector[PROFILE_NAME_OFFSET..PROFILE_NAME_OFFSET + 6],
+            &[0xE5, 0x65, 0x2C, 0x67, 0x9E, 0x8A]
+        );
+        assert!(sector_crc_valid(&sector));
+    }
+
+    #[test]
+    fn parses_all_special_bindings_and_macro_offsets() {
+        let specials = [
+            ("noop", 0x00),
+            ("tilt-left", 0x01),
+            ("tilt-right", 0x02),
+            ("next-dpi", 0x03),
+            ("prev-dpi", 0x04),
+            ("cycle-dpi", 0x05),
+            ("default-dpi", 0x06),
+            ("shift-dpi", 0x07),
+            ("next-profile", 0x08),
+            ("prev-profile", 0x09),
+            ("cycle-profile", 0x0A),
+            ("g-shift", 0x0B),
+            ("battery-indicator", 0x0C),
+            ("scroll-down", 0x10),
+            ("scroll-up", 0x11),
+            ("wheel-mode-toggle", 0x1C),
+            ("ratchet-force-cycle", 0x1D),
+        ];
+        for (name, code) in specials {
+            assert_eq!(parse_binding(name).unwrap(), Binding::Special(code));
+            assert_eq!(special_name(code), name);
+        }
+        let macro_binding = Binding::decode([0x00, 0x2A, 0x12, 0x34]);
+        assert_eq!(
+            macro_binding,
+            Binding::Macro {
+                sector: 0x002A,
+                offset: 0x1234
+            }
+        );
+        assert_eq!(macro_binding.encode().unwrap(), [0x00, 0x2A, 0x12, 0x34]);
+        assert_eq!(parse_binding("macro:0x2a:4660").unwrap(), macro_binding);
+    }
+
+    #[test]
+    fn report_rate_rejects_non_layout_a_formats() {
+        let mut sector = vec![0xFF; 255];
+        update_sector_crc(&mut sector).unwrap();
+        assert!(set_rate(&mut sector, 1000, 6).is_err());
+        assert!(set_rate(&mut sector, 1000, 5).is_ok());
     }
 
     #[test]
