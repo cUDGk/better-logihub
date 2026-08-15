@@ -2,6 +2,7 @@ mod bindings;
 mod daemon;
 mod device_data;
 mod discovery;
+mod ghub_import;
 mod gkeys;
 mod hidpp;
 mod lighting;
@@ -23,6 +24,9 @@ use serde::Serialize;
 
 use device_data::DeviceRecord;
 use discovery::{Discovery, ManagedDevice, discover, error_text};
+use ghub_import::{
+    ImportResult, default_ghub_db_path, import_ghub_database, output_paths, save_import,
+};
 use gkeys::GKeys;
 use hidpp::device::{BatteryStatus, FeatureInfo};
 use lighting::brightness::{
@@ -46,8 +50,8 @@ use onboard::{
 };
 use output::{print_json, print_table};
 use profile::{
-    Profile, default_ghub_db_path, default_store_path, import_ghub_database, load_store,
-    merge_profiles, save_store,
+    Profile, RgbPreset, apply_to_onboard_export, default_output_dir, default_store_path,
+    load_portable_onboard, load_store,
 };
 use specialkeys::{CidReporting, ReportingUpdate, SpecialKeys, ensure_can_remap, resolve_cid};
 
@@ -412,18 +416,30 @@ enum RateCommand {
 
 #[derive(Debug, Subcommand)]
 enum ProfileCommand {
-    /// Import mouse settings from the G HUB settings database.
+    /// Import profiles, assignments, macros, and lighting from G HUB.
     ImportGhub {
         #[arg(long)]
         db: Option<PathBuf>,
+        #[arg(long)]
+        out_dir: Option<PathBuf>,
+        #[arg(long)]
+        device_model: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
     },
     /// List saved profiles.
     List,
-    /// Apply a profile and read the effective values back from the device.
+    /// Show all details for one profile, or every profile when omitted.
+    Show { name: Option<String> },
+    /// Apply a profile live, or import it into onboard memory with --onboard.
     Apply {
         name: String,
         #[arg(long)]
         device: Option<usize>,
+        #[arg(long)]
+        onboard: bool,
+        #[arg(long, requires = "onboard")]
+        yes: bool,
     },
 }
 
@@ -690,6 +706,8 @@ struct ProfileApplyResult {
     device_name: String,
     active_dpi: u16,
     report_rate_hz: u32,
+    lighting_effects: usize,
+    mode: String,
 }
 
 #[derive(Serialize)]
@@ -883,9 +901,20 @@ fn main() -> Result<()> {
         }
         Command::Features { device } => features(&discover_with_warnings()?, device, cli.json),
         Command::Profile { command } => match command {
-            ProfileCommand::ImportGhub { db } => profile_import_ghub(db, cli.json),
+            ProfileCommand::ImportGhub {
+                db,
+                out_dir,
+                device_model,
+                dry_run,
+            } => profile_import_ghub(db, out_dir, device_model.as_deref(), dry_run, cli.json),
             ProfileCommand::List => profile_list(cli.json),
-            ProfileCommand::Apply { name, device } => profile_apply(&name, device, cli.json),
+            ProfileCommand::Show { name } => profile_show(name.as_deref(), cli.json),
+            ProfileCommand::Apply {
+                name,
+                device,
+                onboard,
+                yes,
+            } => profile_apply(&name, device, onboard, yes, cli.json),
         },
         Command::Onboard { command } => match command {
             OnboardCommand::Info { device } => onboard_info(device, cli.json),
@@ -1951,10 +1980,7 @@ fn rgb_set(
     json: bool,
 ) -> Result<()> {
     let target = single_device(discovery, index)?;
-    let rgb = RgbEffects::new(&target.device)?;
-    let capabilities = rgb.capabilities()?;
     let effect = Effect::parse(effect_name)?;
-    let zones = select_rgb_zones(&capabilities, zone)?;
     let options = EffectOptions {
         color: color.map(str::parse).transpose()?,
         color2: color2.map(str::parse).transpose()?,
@@ -1964,7 +1990,29 @@ fn rgb_set(
         intensity,
         direction: direction.map(parse_direction).transpose()?,
     };
-    let params = encode_effect(effect, &options)?;
+    let zones = apply_rgb_effect(target, zone, effect, &options, persistence)?;
+    let result = RgbWriteResult {
+        device: target.index,
+        name: target.name.clone(),
+        effect: effect.name.into(),
+        zones,
+        persistence: persistence_name(persistence).into(),
+        status: "set".into(),
+    };
+    print_rgb_write(result, json)
+}
+
+fn apply_rgb_effect(
+    target: &ManagedDevice,
+    zone: &str,
+    effect: Effect,
+    options: &EffectOptions,
+    persistence: Persistence,
+) -> Result<Vec<u8>> {
+    let rgb = RgbEffects::new(&target.device)?;
+    let capabilities = rgb.capabilities()?;
+    let zones = select_rgb_zones(&capabilities, zone)?;
+    let params = encode_effect(effect, options)?;
     for cluster_index in &zones {
         let cluster = &capabilities.clusters[usize::from(*cluster_index)];
         let supported = cluster
@@ -1986,15 +2034,7 @@ fn rgb_set(
             })?;
         rgb.set_effect(cluster.index, supported.index, params, persistence)?;
     }
-    let result = RgbWriteResult {
-        device: target.index,
-        name: target.name.clone(),
-        effect: effect.name.into(),
-        zones,
-        persistence: persistence_name(persistence).into(),
-        status: "set".into(),
-    };
-    print_rgb_write(result, json)
+    Ok(zones)
 }
 
 fn rgb_info(discovery: &Discovery, index: Option<usize>, json: bool) -> Result<()> {
@@ -2372,12 +2412,25 @@ fn validate_model_key(target: &ManagedDevice, key: &ResolvedKey) -> Result<()> {
 }
 
 fn select_rgb_zones(capabilities: &RgbCapabilities, value: &str) -> Result<Vec<u8>> {
-    if value.eq_ignore_ascii_case("all") {
+    if value.eq_ignore_ascii_case("all") || value.eq_ignore_ascii_case("ZONE_ALL") {
         return Ok(capabilities
             .clusters
             .iter()
             .map(|cluster| cluster.index)
             .collect());
+    }
+    if let Some(location) = ghub_zone_location(value) {
+        let zones = capabilities
+            .clusters
+            .iter()
+            .filter(|cluster| cluster.location == location)
+            .map(|cluster| cluster.index)
+            .collect::<Vec<_>>();
+        ensure!(
+            !zones.is_empty(),
+            "RGB zone {value} (location 0x{location:04X}) is not reported by this device"
+        );
+        return Ok(zones);
     }
     let zone = parse_u8_arg(value).map_err(anyhow::Error::msg)?;
     ensure!(
@@ -2389,6 +2442,32 @@ fn select_rgb_zones(capabilities: &RgbCapabilities, value: &str) -> Result<Vec<u
         capabilities.device.cluster_count.saturating_sub(1)
     );
     Ok(vec![zone])
+}
+
+fn ghub_zone_location(value: &str) -> Option<u16> {
+    Some(match value.to_ascii_uppercase().as_str() {
+        "ZONE_PRIMARY" => 2,
+        "ZONE_LOGO" | "ZONE_BRANDING" => 4,
+        "ZONE_ONE" => 8,
+        "ZONE_TWO" => 16,
+        "ZONE_THREE" => 32,
+        "ZONE_FOUR" => 64,
+        "ZONE_FIVE" => 128,
+        "ZONE_SIX" => 256,
+        "ZONE_SEVEN" => 512,
+        "ZONE_LEFT_SIDE" => 1024,
+        "ZONE_RIGHT_SIDE" => 2048,
+        "ZONE_COMBINED" => 4096,
+        "ZONE_TOP" => 8192,
+        "ZONE_BOTTOM" => 16384,
+        "ZONE_HALO" => 32768,
+        "ZONE_IDLE_STATE" => 129,
+        "ZONE_IN_USE_STATE" => 130,
+        "ZONE_MUTED_STATE" => 131,
+        "ZONE_SOFT_MUTED_STATE" => 132,
+        "ZONE_FULL_SUPPORT" => 65535,
+        _ => return None,
+    })
 }
 
 fn print_rgb_write(result: RgbWriteResult, json: bool) -> Result<()> {
@@ -2515,17 +2594,97 @@ fn parse_seven_hex_bytes(values: &[String]) -> Result<[u8; 7]> {
     Ok(result)
 }
 
-fn profile_import_ghub(db: Option<PathBuf>, json: bool) -> Result<()> {
+fn profile_import_ghub(
+    db: Option<PathBuf>,
+    out_dir: Option<PathBuf>,
+    device_model: Option<&str>,
+    dry_run: bool,
+    json: bool,
+) -> Result<()> {
     let db_path = match db {
         Some(path) => path,
         None => default_ghub_db_path()?,
     };
-    let imported = import_ghub_database(&db_path)?;
-    let store_path = default_store_path()?;
-    let mut store = load_store(&store_path)?;
-    merge_profiles(&mut store, &imported);
-    save_store(&store_path, &store)?;
-    print_profile_rows(&imported, json)
+    let output_dir = match out_dir {
+        Some(path) => path,
+        None => default_output_dir()?,
+    };
+    let mut imported = import_ghub_database(&db_path, device_model)?;
+    let paths = output_paths(&imported, &output_dir);
+    imported.summary.output_files = paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect();
+    imported.summary.dry_run = dry_run;
+    if !dry_run {
+        save_import(&imported, &output_dir)?;
+    }
+    print_import_summary(&imported, json)
+}
+
+fn print_import_summary(imported: &ImportResult, json: bool) -> Result<()> {
+    if json {
+        return print_json(&imported.summary);
+    }
+    let summary = &imported.summary;
+    println!("G HUB import: {}", summary.database);
+    println!(
+        "profiles: {} found / {} imported; cards: {}; applications: {}; assignments: {}",
+        summary.profiles_found,
+        summary.profiles_imported,
+        summary.cards,
+        summary.applications,
+        summary.assignments
+    );
+    println!(
+        "macro cards: {}; lighting cards: {}; device models: {}",
+        summary.macro_cards,
+        summary.lighting_cards,
+        if summary.device_models.is_empty() {
+            "-".into()
+        } else {
+            summary.device_models.join(", ")
+        }
+    );
+    println!(
+        "{}: {}",
+        if summary.dry_run {
+            "would write"
+        } else {
+            "wrote"
+        },
+        if summary.output_files.is_empty() {
+            "nothing".into()
+        } else {
+            summary.output_files.join(", ")
+        }
+    );
+    if summary.dry_run {
+        println!("dry-run: no files written");
+    }
+    if summary.unmapped_classes.is_empty() {
+        println!("unmapped: none");
+    } else {
+        println!("unmapped classes:");
+        for (class, count) in &summary.unmapped_classes {
+            println!("  {class}: {count}");
+        }
+    }
+    if summary.warnings.is_empty() {
+        println!("warnings: none");
+    } else {
+        println!("warnings ({}):", summary.warnings.len());
+        for warning in &summary.warnings {
+            let location = match (&warning.profile, &warning.slot_id) {
+                (Some(profile), Some(slot)) => format!(" [{profile} / {slot}]"),
+                (Some(profile), None) => format!(" [{profile}]"),
+                (None, Some(slot)) => format!(" [{slot}]"),
+                (None, None) => String::new(),
+            };
+            println!("  {}{}: {}", warning.class, location, warning.reason);
+        }
+    }
+    Ok(())
 }
 
 fn profile_list(json: bool) -> Result<()> {
@@ -2533,60 +2692,279 @@ fn profile_list(json: bool) -> Result<()> {
     print_profile_rows(&store.profiles, json)
 }
 
-fn profile_apply(name: &str, index: Option<usize>, json: bool) -> Result<()> {
+fn profile_show(name: Option<&str>, json: bool) -> Result<()> {
+    let store = load_store(&default_store_path()?)?;
+    let profiles = store
+        .profiles
+        .iter()
+        .filter(|profile| name.is_none_or(|name| profile.name == name))
+        .collect::<Vec<_>>();
+    if let Some(name) = name {
+        ensure!(!profiles.is_empty(), "profile {name:?} was not found");
+    }
+    if json {
+        return print_json(&profiles);
+    }
+    if profiles.is_empty() {
+        println!("No saved profiles.");
+        return Ok(());
+    }
+    for profile in profiles {
+        println!(
+            "{} ({}) — models: {}; DPI: {} [{}]; shift: {}; rate: {} Hz",
+            profile.name,
+            profile.source,
+            if profile.device_models.is_empty() {
+                "-".into()
+            } else {
+                profile.device_models.join(", ")
+            },
+            profile.active_dpi,
+            profile
+                .dpi_levels
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+            profile.shift_dpi,
+            profile.report_rate_hz
+        );
+        if !profile.bindings.is_empty() {
+            let rows = profile
+                .bindings
+                .iter()
+                .map(|binding| {
+                    vec![
+                        binding.slot_id.clone(),
+                        binding.source_action.clone(),
+                        binding.onboard_binding.clone(),
+                        binding
+                            .daemon_action
+                            .as_ref()
+                            .map(|action| serde_json::to_string(action).unwrap_or_default())
+                            .unwrap_or_else(|| "-".into()),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            print_table(&["SLOT", "SOURCE", "ONBOARD", "DAEMON"], &rows);
+        }
+        if !profile.macros.is_empty() {
+            let rows = profile
+                .macros
+                .iter()
+                .map(|r#macro| {
+                    vec![
+                        r#macro.name.clone(),
+                        r#macro.macro_type.clone(),
+                        r#macro.daemon_action.is_some().to_string(),
+                        r#macro.onboard_macro.is_some().to_string(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            print_table(&["MACRO", "TYPE", "DAEMON", "ONBOARD"], &rows);
+        }
+        if !profile.lighting.is_empty() {
+            let rows = profile
+                .lighting
+                .iter()
+                .map(|preset| {
+                    vec![
+                        preset.zone.clone(),
+                        preset.effect.clone(),
+                        preset.color.clone().unwrap_or_else(|| "-".into()),
+                        preset.persist.clone(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            print_table(&["ZONE", "EFFECT", "COLOR", "PERSIST"], &rows);
+        }
+        for warning in &profile.warnings {
+            println!("warning: {warning}");
+        }
+    }
+    Ok(())
+}
+
+fn profile_apply(
+    name: &str,
+    index: Option<usize>,
+    onboard_mode: bool,
+    yes: bool,
+    json: bool,
+) -> Result<()> {
     let store = load_store(&default_store_path()?)?;
     let profile = store
         .profiles
         .iter()
         .find(|profile| profile.name == name)
         .with_context(|| format!("profile {name:?} was not found"))?;
+    if onboard_mode {
+        ensure!(
+            yes,
+            "onboard profile apply writes device memory and requires --yes"
+        );
+        return profile_apply_onboard(profile, index, json);
+    }
     let discovery = discover_with_warnings()?;
     let target = single_device(&discovery, index)?;
+    ensure_profile_matches_device(profile, target)?;
 
-    target
-        .device
-        .set_dpi(profile.active_dpi)
-        .map_err(anyhow::Error::new)
-        .with_context(|| format!("failed to apply {} DPI", profile.active_dpi))?;
-    target
-        .device
-        .set_report_rate(profile.report_rate_hz)
-        .map_err(anyhow::Error::new)
-        .with_context(|| format!("failed to apply {} Hz report rate", profile.report_rate_hz))?;
+    if profile.active_dpi != 0 {
+        target
+            .device
+            .set_dpi(profile.active_dpi)
+            .map_err(anyhow::Error::new)
+            .with_context(|| format!("failed to apply {} DPI", profile.active_dpi))?;
+    }
+    if profile.report_rate_hz != 0 {
+        target
+            .device
+            .set_report_rate(profile.report_rate_hz)
+            .map_err(anyhow::Error::new)
+            .with_context(|| {
+                format!("failed to apply {} Hz report rate", profile.report_rate_hz)
+            })?;
+    }
+    for preset in &profile.lighting {
+        apply_profile_rgb(target, preset)?;
+    }
 
-    let active_dpi = target
-        .device
-        .dpi()
-        .map_err(anyhow::Error::new)
-        .context("DPI was set but could not be read back")?;
-    let report_rate_hz = target
-        .device
-        .report_rate()
-        .map_err(anyhow::Error::new)
-        .context("report rate was set but could not be read back")?;
+    let active_dpi = if profile.active_dpi == 0 {
+        0
+    } else {
+        target
+            .device
+            .dpi()
+            .map_err(anyhow::Error::new)
+            .context("DPI was set but could not be read back")?
+    };
+    let report_rate_hz = if profile.report_rate_hz == 0 {
+        0
+    } else {
+        target
+            .device
+            .report_rate()
+            .map_err(anyhow::Error::new)
+            .context("report rate was set but could not be read back")?
+    };
     let result = ProfileApplyResult {
         profile: profile.name.clone(),
         device: target.index,
         device_name: target.name.clone(),
         active_dpi,
         report_rate_hz,
+        lighting_effects: profile.lighting.len(),
+        mode: "live".into(),
     };
 
     if json {
         print_json(&result)
     } else {
         print_table(
-            &["PROFILE", "DEVICE", "NAME", "ACTIVE DPI", "RATE (HZ)"],
+            &[
+                "PROFILE",
+                "DEVICE",
+                "NAME",
+                "ACTIVE DPI",
+                "RATE (HZ)",
+                "LIGHTING",
+                "MODE",
+            ],
             &[vec![
                 result.profile,
                 result.device.to_string(),
                 result.device_name,
                 result.active_dpi.to_string(),
                 result.report_rate_hz.to_string(),
+                result.lighting_effects.to_string(),
+                result.mode,
             ]],
         );
         Ok(())
     }
+}
+
+fn ensure_profile_matches_device(profile: &Profile, target: &ManagedDevice) -> Result<()> {
+    if profile.device_models.is_empty() {
+        return Ok(());
+    }
+    let model = target
+        .model
+        .context("the selected device has no recognized model id")?;
+    ensure!(
+        profile
+            .device_models
+            .iter()
+            .any(|candidate| candidate.eq_ignore_ascii_case(&model.model_id)),
+        "profile {:?} targets {}, but selected device is {}",
+        profile.name,
+        profile.device_models.join(", "),
+        model.model_id
+    );
+    Ok(())
+}
+
+fn apply_profile_rgb(target: &ManagedDevice, preset: &RgbPreset) -> Result<()> {
+    let effect = Effect::parse(&preset.effect)?;
+    let options = EffectOptions {
+        color: preset.color.as_deref().map(str::parse).transpose()?,
+        color2: preset.color2.as_deref().map(str::parse).transpose()?,
+        speed: preset.speed,
+        period_ms: preset.period,
+        brightness: preset.brightness,
+        intensity: preset.intensity,
+        direction: preset
+            .direction
+            .as_deref()
+            .map(parse_direction)
+            .transpose()?,
+    };
+    let persistence = match preset.persist.to_ascii_lowercase().as_str() {
+        "ram" => Persistence::Ram,
+        "nvm" | "nv" => Persistence::Nvm,
+        "powersave" | "power_save" => Persistence::PowerSave,
+        value => bail!("unknown RGB persistence {value:?}"),
+    };
+    apply_rgb_effect(target, &preset.zone, effect, &options, persistence)?;
+    Ok(())
+}
+
+fn profile_apply_onboard(profile: &Profile, index: Option<usize>, json: bool) -> Result<()> {
+    let discovery = discover_with_warnings()?;
+    let target = single_device(&discovery, index)?;
+    ensure_profile_matches_device(profile, target)?;
+    let model = target.model.context("selected device model is unknown")?;
+    let onboard = Onboard::new(&target.device)?;
+    let current = onboard.dump()?;
+    let mut exported = export_state(&current, device_kind(target))?;
+    for warning in apply_to_onboard_export(profile, &model.model_id, &mut exported)? {
+        eprintln!("warning: {warning}");
+    }
+    let diffs = import_plan(&exported, &current, device_kind(target))?;
+    print_sector_diff(&diffs, false, json)?;
+    if diffs.is_empty() {
+        return Ok(());
+    }
+    require_backup(&current.description)?;
+    let methods = write_sector_diffs(
+        &onboard,
+        &current.description,
+        &exported.directory.entries,
+        &diffs,
+    )?;
+    print_onboard_result(
+        OnboardWriteResult {
+            device: target.index,
+            name: target.name.clone(),
+            operation: format!(
+                "apply onboard profile {:?} ({} sectors)",
+                profile.name,
+                diffs.len()
+            ),
+            status: verification_summary(&methods),
+        },
+        json,
+    )
 }
 
 fn print_profile_rows(profiles: &[Profile], json: bool) -> Result<()> {
@@ -2754,11 +3132,35 @@ fn onboard_import(
     index: Option<usize>,
     json: bool,
 ) -> Result<()> {
-    let exported = load_export(input)?;
+    let portable = load_portable_onboard(input)?;
+    let file_export = if portable.is_none() {
+        Some(load_export(input)?)
+    } else {
+        None
+    };
     let discovery = discover_with_warnings()?;
     let target = single_device(&discovery, index)?;
     let onboard = Onboard::new(&target.device)?;
     let current = onboard.dump()?;
+    let exported = if let Some(portable) = portable {
+        let model = target.model.context("selected device model is unknown")?;
+        let expected = device_data::lookup_model(&portable.device_model)
+            .map(|record| record.model_id.as_str())
+            .unwrap_or(&portable.device_model);
+        ensure!(
+            model.model_id.eq_ignore_ascii_case(expected),
+            "portable profile targets {}, but selected device is {}",
+            portable.device_model,
+            model.model_id
+        );
+        let mut exported = export_state(&current, device_kind(target))?;
+        for warning in apply_to_onboard_export(&portable.profile, &model.model_id, &mut exported)? {
+            eprintln!("warning: {warning}");
+        }
+        exported
+    } else {
+        file_export.context("non-portable onboard export was not loaded")?
+    };
     let diffs = import_plan(&exported, &current, device_kind(target))?;
     print_sector_diff(&diffs, dry_run, json)?;
     if dry_run || diffs.is_empty() {

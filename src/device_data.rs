@@ -90,6 +90,30 @@ pub fn lookup(vid: u16, pid: u16) -> Option<&'static DeviceRecord> {
     })
 }
 
+pub fn lookup_model(value: &str) -> Option<&'static DeviceRecord> {
+    let normalized = value.trim().to_ascii_lowercase();
+    registry().devices.iter().find(|device| {
+        device.model_id.eq_ignore_ascii_case(&normalized)
+            || device
+                .slot_prefix
+                .as_deref()
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case(&normalized))
+            || device
+                .model_id
+                .replace('_', "-")
+                .eq_ignore_ascii_case(&normalized)
+    })
+}
+
+pub fn lookup_slot_prefix(value: &str) -> Option<&'static DeviceRecord> {
+    registry().devices.iter().find(|device| {
+        device
+            .slot_prefix
+            .as_deref()
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(value))
+    })
+}
+
 fn registry() -> &'static Registry {
     static REGISTRY: OnceLock<Registry> = OnceLock::new();
     REGISTRY.get_or_init(|| {

@@ -1,22 +1,100 @@
-use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 
+use crate::bindings::Action;
+use crate::lighting::rgb::{Effect, EffectOptions, RgbColor, encode_effect, parse_direction};
+use crate::onboard::{
+    Binding as OnboardBinding, DpiTable, ExportBinding, LedSlot, Macro as OnboardMacro,
+    OnboardExport, parse_binding, repack_export_macros,
+};
+
 const STORE_VERSION: u32 = 1;
+const PORTABLE_ONBOARD_VERSION: u32 = 1;
+const RGB_PRESET_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Profile {
     pub name: String,
     pub source: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub application_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub device_models: Vec<String>,
     pub dpi_levels: Vec<u16>,
+    #[serde(default)]
+    pub default_dpi: u16,
     pub active_dpi: u16,
     pub shift_dpi: u16,
     pub report_rate_hz: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bindings: Vec<ProfileBinding>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub macros: Vec<ImportedMacro>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lighting: Vec<RgbPreset>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileBinding {
+    pub slot_id: String,
+    pub device_model: String,
+    pub slot_prefix: String,
+    pub input: String,
+    pub mode: u8,
+    pub shifted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attribute: Option<String>,
+    pub card_id: String,
+    pub source_action: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_action: Option<Action>,
+    pub onboard_binding: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onboard_macro: Option<OnboardMacro>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImportedMacro {
+    pub card_id: String,
+    pub name: String,
+    pub macro_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_action: Option<Action>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onboard_macro: Option<OnboardMacro>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RgbPreset {
+    pub zone: String,
+    pub effect: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color2: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub period: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brightness: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intensity: Option<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direction: Option<String>,
+    pub persist: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,10 +112,45 @@ impl Default for ProfileStore {
     }
 }
 
-pub fn default_ghub_db_path() -> Result<PathBuf> {
-    let base = env::var_os("LOCALAPPDATA")
-        .context("LOCALAPPDATA is not set; pass the G HUB database with --db <path>")?;
-    Ok(PathBuf::from(base).join("LGHUB").join("settings.db"))
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortableOnboardProfile {
+    pub version: u32,
+    pub kind: String,
+    pub device_model: String,
+    pub profile: Profile,
+}
+
+impl PortableOnboardProfile {
+    pub fn new(device_model: String, mut profile: Profile) -> Self {
+        profile.device_models = vec![device_model.clone()];
+        Self {
+            version: PORTABLE_ONBOARD_VERSION,
+            kind: "better-logihub-onboard-profile".into(),
+            device_model,
+            profile,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RgbPresetFile {
+    pub version: u32,
+    pub profile: String,
+    pub device_model: String,
+    pub command: String,
+    pub invocations: Vec<RgbPreset>,
+}
+
+impl RgbPresetFile {
+    pub fn new(profile: &Profile, device_model: &str) -> Self {
+        Self {
+            version: RGB_PRESET_VERSION,
+            profile: profile.name.clone(),
+            device_model: device_model.into(),
+            command: "logihub rgb set".into(),
+            invocations: profile.lighting.clone(),
+        }
+    }
 }
 
 pub fn default_store_path() -> Result<PathBuf> {
@@ -47,20 +160,11 @@ pub fn default_store_path() -> Result<PathBuf> {
         .join("profiles.json"))
 }
 
-pub fn import_ghub_database(path: &Path) -> Result<Vec<Profile>> {
-    let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .with_context(|| format!("failed to open G HUB settings database {}", path.display()))?;
-    let blob = connection
-        .query_row(
-            "SELECT file FROM data ORDER BY _id DESC LIMIT 1",
-            [],
-            |row| row.get::<_, Vec<u8>>(0),
-        )
-        .optional()
-        .context("failed to read the newest row from G HUB data table")?
-        .context("G HUB data table is empty")?;
-    let json = String::from_utf8(blob).context("G HUB settings BLOB is not valid UTF-8")?;
-    extract_ghub_profiles(&json).context("failed to parse G HUB settings JSON")
+pub fn default_output_dir() -> Result<PathBuf> {
+    default_store_path()?
+        .parent()
+        .map(Path::to_path_buf)
+        .context("profile store has no parent directory")
 }
 
 pub fn load_store(path: &Path) -> Result<ProfileStore> {
@@ -87,14 +191,36 @@ pub fn load_store(path: &Path) -> Result<ProfileStore> {
 }
 
 pub fn save_store(path: &Path, store: &ProfileStore) -> Result<()> {
+    save_json(path, store, "profiles")
+}
+
+pub fn save_json<T: Serialize + ?Sized>(path: &Path, value: &T, label: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("failed to create profile directory {}", parent.display()))?;
     }
-    let mut json = serde_json::to_vec_pretty(store).context("failed to serialize profiles")?;
+    let mut json =
+        serde_json::to_vec_pretty(value).with_context(|| format!("failed to serialize {label}"))?;
     json.push(b'\n');
-    fs::write(path, json)
-        .with_context(|| format!("failed to write profile store {}", path.display()))
+    fs::write(path, json).with_context(|| format!("failed to write {label} {}", path.display()))
+}
+
+pub fn load_portable_onboard(path: &Path) -> Result<Option<PortableOnboardProfile>> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse {}", path.display()))?;
+    if value.get("kind").and_then(serde_json::Value::as_str)
+        != Some("better-logihub-onboard-profile")
+    {
+        return Ok(None);
+    }
+    let portable: PortableOnboardProfile = serde_json::from_value(value)?;
+    ensure!(
+        portable.version == PORTABLE_ONBOARD_VERSION,
+        "unsupported portable onboard profile version {}",
+        portable.version
+    );
+    Ok(Some(portable))
 }
 
 pub fn merge_profiles(store: &mut ProfileStore, imported: &[Profile]) {
@@ -111,202 +237,267 @@ pub fn merge_profiles(store: &mut ProfileStore, imported: &[Profile]) {
     }
 }
 
-fn extract_ghub_profiles(json: &str) -> Result<Vec<Profile>> {
-    let document: GhubDocument = serde_json::from_str(json)?;
-    let cards = document
-        .cards
-        .cards
-        .into_iter()
-        .filter(|card| card.attribute == "MOUSE_SETTINGS")
-        .filter_map(|card| card.mouse_settings.map(|settings| (card.id, settings)))
-        .collect::<HashMap<_, _>>();
-    let applications = document
-        .applications
-        .applications
-        .into_iter()
-        .map(|application| (application.application_id, application.name))
-        .collect::<HashMap<_, _>>();
-
-    let mut profiles = Vec::new();
-    for ghub_profile in document.profiles.profiles {
-        let Some(card_id) = ghub_profile
-            .assignments
+pub fn apply_to_onboard_export(
+    profile: &Profile,
+    device_model: &str,
+    export: &mut OnboardExport,
+) -> Result<Vec<String>> {
+    ensure!(
+        profile
+            .device_models
             .iter()
-            .find(|assignment| assignment.slot_id.ends_with("_mouse_settings"))
-            .map(|assignment| assignment.card_id.as_str())
-        else {
-            continue;
-        };
-        let Some(settings) = cards.get(card_id) else {
-            continue;
-        };
-        let name = if ghub_profile.name == "PROFILE_NAME_DEFAULT" {
-            applications
-                .get(&ghub_profile.application_id)
-                .map(|name| display_application_name(name))
-                .unwrap_or_else(|| ghub_profile.application_id.clone())
-        } else {
-            ghub_profile.name
-        };
-        profiles.push(Profile {
-            name,
-            source: "ghub-import".into(),
-            dpi_levels: settings.dpi_table.levels.clone(),
-            active_dpi: settings.dpi_table.active_dpi,
-            shift_dpi: settings.dpi_table.shift_dpi,
-            report_rate_hz: settings.report_rate.value,
-        });
+            .any(|model| model.eq_ignore_ascii_case(device_model)),
+        "profile {:?} has no settings for device model {device_model}",
+        profile.name
+    );
+    let keyboard = export.device_type.eq_ignore_ascii_case("KEYBOARD");
+    let mut warnings = Vec::new();
+    let relevant = profile
+        .bindings
+        .iter()
+        .filter(|binding| binding.device_model.eq_ignore_ascii_case(device_model))
+        .collect::<Vec<_>>();
+    let mut modes = relevant
+        .iter()
+        .map(|binding| binding.mode)
+        .collect::<Vec<_>>();
+    if modes.is_empty() {
+        modes.push(1);
     }
-    Ok(profiles)
+    modes.sort_unstable();
+    modes.dedup();
+
+    for mode in modes {
+        let Some(target) = export.profiles.get_mut(usize::from(mode.saturating_sub(1))) else {
+            warnings.push(format!(
+                "M{mode} assignments exceed the device's {} onboard profile slots",
+                export.profiles.len()
+            ));
+            continue;
+        };
+        target.name = Some(onboard_name(&profile.name));
+        if profile.report_rate_hz != 0 {
+            target.rate_hz = Some(profile.report_rate_hz);
+        }
+        if !keyboard && !profile.dpi_levels.is_empty() {
+            target.dpi = Some(dpi_table(profile)?);
+        }
+        for binding in &mut target.bindings {
+            *binding = unassigned_export_binding(binding.number, &binding.control)?;
+        }
+        for binding in &mut target.gshift_bindings {
+            *binding = unassigned_export_binding(binding.number, &binding.control)?;
+        }
+
+        let mut inherited = Vec::new();
+        for binding in relevant.iter().filter(|binding| binding.mode == mode) {
+            let Some(number) = binding
+                .input
+                .strip_prefix('g')
+                .and_then(|value| value.parse::<usize>().ok())
+            else {
+                warnings.push(format!(
+                    "{} is software-only and has no onboard button-table entry",
+                    binding.slot_id
+                ));
+                continue;
+            };
+            let bank = if binding.shifted {
+                &mut target.gshift_bindings
+            } else {
+                &mut target.bindings
+            };
+            if !(1..=bank.len()).contains(&number) {
+                warnings.push(format!(
+                    "{} selects button {number}, but the target has {} entries",
+                    binding.slot_id,
+                    bank.len()
+                ));
+                continue;
+            }
+            if binding.onboard_binding == "inherit" {
+                inherited.push(number);
+                continue;
+            }
+            bank[number - 1] = imported_export_binding(
+                number,
+                &bank[number - 1].control,
+                &binding.onboard_binding,
+                binding.onboard_macro.clone(),
+            )?;
+            warnings.extend(binding.warnings.iter().cloned());
+        }
+        for number in inherited {
+            target.gshift_bindings[number - 1] = target.bindings[number - 1].clone();
+        }
+
+        for (slot, preset) in profile.lighting.iter().take(4).enumerate() {
+            if slot >= target.led_slots.len() {
+                warnings.push(format!(
+                    "lighting slot {slot} exceeds the device's {} LED slots",
+                    target.led_slots.len()
+                ));
+                continue;
+            }
+            match led_slot(slot, preset) {
+                Ok(value) => target.led_slots[slot] = value,
+                Err(error) => {
+                    warnings.push(format!(
+                        "{} cannot be stored in onboard LED slot {slot}: {error}; replaced with OFF",
+                        preset.effect
+                    ));
+                    target.led_slots[slot] = off_led_slot(slot);
+                }
+            }
+        }
+        if profile.lighting.len() > 4 {
+            warnings.push(format!(
+                "{} lighting effects exceed the four layout-A LED slots",
+                profile.lighting.len()
+            ));
+        }
+    }
+    repack_export_macros(export)?;
+    warnings.sort();
+    warnings.dedup();
+    Ok(warnings)
 }
 
-fn display_application_name(name: &str) -> String {
-    if name == "APPLICATION_NAME_DESKTOP" {
-        "Desktop".into()
+fn dpi_table(profile: &Profile) -> Result<DpiTable> {
+    let default = if profile.default_dpi == 0 {
+        profile.active_dpi
     } else {
-        name.to_owned()
+        profile.default_dpi
+    };
+    let default_index = profile
+        .dpi_levels
+        .iter()
+        .position(|value| *value == default)
+        .with_context(|| format!("default DPI {default} is absent from the DPI table"))?;
+    let shift_index = if profile.shift_dpi == 0 {
+        None
+    } else {
+        Some(
+            profile
+                .dpi_levels
+                .iter()
+                .position(|value| *value == profile.shift_dpi)
+                .with_context(|| {
+                    format!(
+                        "shift DPI {} is absent from the DPI table",
+                        profile.shift_dpi
+                    )
+                })? as u8,
+        )
+    };
+    Ok(DpiTable {
+        levels: profile.dpi_levels.clone(),
+        default_index: default_index as u8,
+        shift_index,
+    })
+}
+
+fn unassigned_export_binding(number: usize, control: &str) -> Result<ExportBinding> {
+    imported_export_binding(number, control, "disabled", None)
+}
+
+fn imported_export_binding(
+    number: usize,
+    control: &str,
+    binding: &str,
+    r#macro: Option<OnboardMacro>,
+) -> Result<ExportBinding> {
+    let parsed = if r#macro.is_some() {
+        OnboardBinding::Macro {
+            sector: 0,
+            offset: 0,
+        }
+    } else {
+        parse_binding(binding)?
+    };
+    let raw = parsed.encode()?;
+    Ok(ExportBinding {
+        number,
+        control: control.into(),
+        binding: parsed.to_string(),
+        raw_hex: hex(&raw),
+        r#macro,
+    })
+}
+
+fn led_slot(slot: usize, preset: &RgbPreset) -> Result<LedSlot> {
+    let effect = Effect::parse(&preset.effect)?;
+    ensure!(
+        effect.name != "streaming",
+        "STREAMING is live-only according to firmware_lighting"
+    );
+    let options = EffectOptions {
+        color: preset
+            .color
+            .as_deref()
+            .map(str::parse::<RgbColor>)
+            .transpose()?,
+        color2: preset
+            .color2
+            .as_deref()
+            .map(str::parse::<RgbColor>)
+            .transpose()?,
+        speed: preset.speed,
+        period_ms: preset.period,
+        brightness: preset.brightness,
+        intensity: preset.intensity,
+        direction: preset
+            .direction
+            .as_deref()
+            .map(parse_direction)
+            .transpose()?,
+    };
+    let raw_id = u8::try_from(effect.raw_id).context("RGB effect id does not fit an LED slot")?;
+    let parameters = encode_effect(effect, &options)?;
+    let mut raw = Vec::with_capacity(11);
+    raw.push(raw_id);
+    raw.extend_from_slice(&parameters);
+    Ok(LedSlot {
+        slot,
+        effect: effect.name.into(),
+        raw_id,
+        parameters_hex: hex(&parameters),
+        raw_hex: hex(&raw),
+    })
+}
+
+fn off_led_slot(slot: usize) -> LedSlot {
+    LedSlot {
+        slot,
+        effect: "off".into(),
+        raw_id: 0,
+        parameters_hex: "00000000000000000000".into(),
+        raw_hex: "0000000000000000000000".into(),
     }
 }
 
-#[derive(Deserialize)]
-struct GhubDocument {
-    profiles: GhubProfiles,
-    cards: GhubCards,
-    applications: GhubApplications,
+fn onboard_name(value: &str) -> String {
+    let mut result = String::new();
+    let mut units = 0;
+    for character in value.chars() {
+        let count = character.len_utf16();
+        if units + count > 24 {
+            break;
+        }
+        result.push(character);
+        units += count;
+    }
+    result
 }
 
-#[derive(Deserialize)]
-struct GhubProfiles {
-    profiles: Vec<GhubProfile>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GhubProfile {
-    name: String,
-    application_id: String,
-    assignments: Vec<GhubAssignment>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GhubAssignment {
-    card_id: String,
-    slot_id: String,
-}
-
-#[derive(Deserialize)]
-struct GhubCards {
-    cards: Vec<GhubCard>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GhubCard {
-    attribute: String,
-    id: String,
-    mouse_settings: Option<GhubMouseSettings>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GhubMouseSettings {
-    dpi_table: GhubDpiTable,
-    report_rate: GhubReportRate,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GhubDpiTable {
-    active_dpi: u16,
-    shift_dpi: u16,
-    levels: Vec<u16>,
-}
-
-#[derive(Deserialize)]
-struct GhubReportRate {
-    value: u32,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GhubApplications {
-    applications: Vec<GhubApplication>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GhubApplication {
-    application_id: String,
-    name: String,
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02X}")).collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn extracts_mouse_profiles_and_resolves_default_name() {
-        let json = r#"
-        {
-          "profiles": {"profiles": [
-            {
-              "id": "profile-desktop",
-              "name": "PROFILE_NAME_DEFAULT",
-              "applicationId": "desktop-app",
-              "assignments": [
-                {"cardId": "buttons", "slotId": "primary_button_settings"},
-                {"cardId": "mouse-card", "slotId": "primary_mouse_settings"}
-              ]
-            },
-            {
-              "id": "buttons-only",
-              "name": "Buttons only",
-              "applicationId": "desktop-app",
-              "assignments": [
-                {"cardId": "buttons", "slotId": "primary_button_settings"}
-              ]
-            },
-            {
-              "id": "missing-card",
-              "name": "Missing card",
-              "applicationId": "game-app",
-              "assignments": [
-                {"cardId": "not-present", "slotId": "game_mouse_settings"}
-              ]
-            }
-          ]},
-          "cards": {"cards": [
-            {
-              "attribute": "MOUSE_SETTINGS",
-              "id": "mouse-card",
-              "mouseSettings": {
-                "dpiTable": {
-                  "activeDpi": 4000,
-                  "defaultDpi": 1600,
-                  "shiftDpi": 800,
-                  "levels": [800, 1200, 1600, 4000, 7000]
-                },
-                "reportRate": {"value": 1000}
-              }
-            },
-            {"attribute": "BUTTON_SETTINGS", "id": "buttons"}
-          ]},
-          "applications": {"applications": [
-            {"applicationId": "desktop-app", "name": "APPLICATION_NAME_DESKTOP"},
-            {"applicationId": "game-app", "name": "Example Game"}
-          ]}
-        }
-        "#;
-
-        let profiles = extract_ghub_profiles(json).unwrap();
-        assert_eq!(profiles.len(), 1);
-        assert_eq!(profiles[0].name, "Desktop");
-        assert_eq!(profiles[0].dpi_levels, [800, 1200, 1600, 4000, 7000]);
-        assert_eq!(profiles[0].active_dpi, 4000);
-        assert_eq!(profiles[0].shift_dpi, 800);
-        assert_eq!(profiles[0].report_rate_hz, 1000);
-    }
+    use crate::onboard::{Description, DirectoryEntry, ExportDirectory, ExportProfile, RawSector};
 
     #[test]
     fn merge_overwrites_same_name_and_keeps_other_profiles() {
@@ -324,14 +515,117 @@ mod tests {
         assert_eq!(store.profiles[2], profile("New Game", 3200));
     }
 
+    #[test]
+    fn older_version_one_profiles_gain_empty_phase_e_fields() {
+        let value = r#"{
+          "version":1,
+          "profiles":[{
+            "name":"Desktop","source":"ghub-import","dpi_levels":[800],
+            "active_dpi":800,"shift_dpi":800,"report_rate_hz":1000
+          }]
+        }"#;
+        let store: ProfileStore = serde_json::from_str(value).unwrap();
+        assert!(store.profiles[0].bindings.is_empty());
+        assert_eq!(store.profiles[0].default_dpi, 0);
+    }
+
+    #[test]
+    fn imported_profile_overlays_the_phase_d_export_schema() {
+        let imported = crate::ghub_import::import_ghub_json(
+            include_str!("../tests/fixtures/ghub_minimal.json"),
+            None,
+        )
+        .unwrap();
+        let mut export = synthetic_mouse_export();
+
+        let warnings =
+            apply_to_onboard_export(&imported.profiles[0], "g502x_lightspeed", &mut export)
+                .unwrap();
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let profile = &export.profiles[0];
+        assert_eq!(profile.dpi.as_ref().unwrap().default_index, 3);
+        assert_eq!(profile.dpi.as_ref().unwrap().shift_index, Some(0));
+        assert_eq!(profile.rate_hz, Some(1000));
+        assert_eq!(profile.bindings[4].binding, "key:f5");
+        assert_eq!(profile.gshift_bindings[4].binding, "key:f5");
+        assert!(profile.bindings[6].binding.starts_with("macro:"));
+        assert_eq!(export.macro_sectors.len(), 2);
+        assert_eq!(profile.led_slots[0].effect, "breathing");
+    }
+
+    fn synthetic_mouse_export() -> OnboardExport {
+        let binding = |number| ExportBinding {
+            number,
+            control: format!("g{number}"),
+            binding: "disabled".into(),
+            raw_hex: "FFFFFFFF".into(),
+            r#macro: None,
+        };
+        let bindings = (1..=11).map(binding).collect::<Vec<_>>();
+        let led_slot = |slot| LedSlot {
+            slot,
+            effect: "off".into(),
+            raw_id: 0,
+            parameters_hex: "00000000000000000000".into(),
+            raw_hex: "0000000000000000000000".into(),
+        };
+        OnboardExport {
+            version: 1,
+            device_type: "MOUSE".into(),
+            description: Description {
+                raw: [0; 16],
+                memory_model_id: 1,
+                profile_format_id: 1,
+                macro_format_id: 1,
+                profile_count: 1,
+                profile_count_oob: 0,
+                button_count: 11,
+                sector_count: 4,
+                sector_size: 255,
+                mechanical_layout: 0,
+                various_info: 0,
+            },
+            directory: ExportDirectory {
+                entries: vec![DirectoryEntry {
+                    index: 0,
+                    sector: 1,
+                    enabled: true,
+                }],
+                raw_sector_hex: String::new(),
+            },
+            profiles: vec![ExportProfile {
+                index: 0,
+                sector: 1,
+                enabled: true,
+                name: None,
+                rate_hz: None,
+                dpi: None,
+                bindings: bindings.clone(),
+                gshift_bindings: bindings,
+                led_slots: (0..4).map(led_slot).collect(),
+                raw_sector_hex: String::new(),
+            }],
+            macro_sectors: Vec::<RawSector>::new(),
+        }
+    }
+
     fn profile(name: &str, active_dpi: u16) -> Profile {
         Profile {
             name: name.into(),
             source: "ghub-import".into(),
+            id: String::new(),
+            application_id: String::new(),
+            device_models: Vec::new(),
             dpi_levels: vec![active_dpi],
+            default_dpi: active_dpi,
             active_dpi,
             shift_dpi: active_dpi,
             report_rate_hz: 1000,
+            bindings: Vec::new(),
+            macros: Vec::new(),
+            lighting: Vec::new(),
+            warnings: Vec::new(),
         }
     }
 }

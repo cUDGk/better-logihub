@@ -1,0 +1,99 @@
+{
+  "profiles": {
+    "profiles": [
+      {
+        "id": "fixture-profile",
+        "applicationId": "fixture-desktop",
+        "name": "PROFILE_NAME_DEFAULT",
+        "lightingCard": "33333333-3333-3333-3333-333333333333",
+        "assignments": [
+          {
+            "slotId": "g502x-lightspeed_mouse_settings",
+            "cardId": "11111111-1111-1111-1111-111111111111"
+          },
+          {
+            "slotId": "g502x-lightspeed_g5_m1",
+            "cardId": "0f82f693-5b78-4cf5-867e-013e00000000"
+          },
+          {
+            "slotId": "g502x-lightspeed_g5_m1_shifted",
+            "cardId": "0f82f693-5b78-4cf5-867e-090700000000"
+          },
+          {
+            "slotId": "g502x-lightspeed_g7_m1",
+            "cardId": "22222222-2222-2222-2222-222222222222"
+          },
+          {
+            "slotId": "g502x-lightspeed_g7_m1_shifted",
+            "cardId": "0f82f693-5b78-4cf5-867e-090700000000"
+          }
+        ]
+      }
+    ]
+  },
+  "cards": {
+    "cards": [
+      {
+        "id": "11111111-1111-1111-1111-111111111111",
+        "attribute": "MOUSE_SETTINGS",
+        "mouseSettings": {
+          "dpiTable": {
+            "levels": [800, 1200, 1600, 4000, 7000],
+            "defaultDpi": 4000,
+            "activeDpi": 4000,
+            "shiftDpi": 800
+          },
+          "reportRate": { "value": 1000 }
+        }
+      },
+      {
+        "id": "22222222-2222-2222-2222-222222222222",
+        "attribute": "MACRO_PLAYBACK",
+        "name": "Example Macro",
+        "macro": {
+          "type": "SEQUENCE",
+          "onboardable": true,
+          "sequences": {
+            "useSimpleActions": true,
+            "simpleSequence": {
+              "components": [
+                { "keyboard": { "hidUsage": 224, "isDown": true } },
+                { "keyboard": { "hidUsage": 6, "isDown": true } },
+                { "delay": { "durationMs": 50 } },
+                { "keyboard": { "hidUsage": 6, "isDown": false } },
+                { "keyboard": { "hidUsage": 224, "isDown": false } }
+              ]
+            }
+          }
+        }
+      },
+      {
+        "id": "33333333-3333-3333-3333-333333333333",
+        "attribute": "LIGHTING_SETTINGS",
+        "lightingSettings": {
+          "firmwareEffects": [
+            {
+              "id": "BREATHING",
+              "zoneType": "ZONE_PRIMARY",
+              "persistent": true,
+              "breathingParams": {
+                "color": { "hex": "#ff0000" },
+                "periodInMs": 2000,
+                "intensity": 1.0
+              }
+            }
+          ],
+          "brightness": { "value": 100, "isOff": false }
+        }
+      }
+    ]
+  },
+  "applications": {
+    "applications": [
+      {
+        "applicationId": "fixture-desktop",
+        "name": "APPLICATION_NAME_DESKTOP"
+      }
+    ]
+  }
+}

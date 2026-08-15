@@ -11,13 +11,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::specialkeys::resolve_cid;
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bindings {
     #[serde(default)]
     pub devices: BTreeMap<String, DeviceBindings>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeviceBindings {
     #[serde(default)]
     pub gkeys: BTreeMap<String, Action>,
@@ -25,7 +25,7 @@ pub struct DeviceBindings {
     pub cids: BTreeMap<String, Action>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Action {
     Keys(KeysAction),
@@ -35,37 +35,37 @@ pub enum Action {
     None(NoneAction),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct KeysAction {
     pub keys: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TextAction {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunAction {
     pub run: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MacroAction {
     pub r#macro: Vec<MacroStep>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NoneAction {
     pub none: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MacroStep {
     Keys(KeysAction),
@@ -73,7 +73,7 @@ pub enum MacroStep {
     Text(TextAction),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DelayStep {
     pub delay_ms: u64,
@@ -116,6 +116,30 @@ pub fn load_or_create(path: &Path) -> Result<(Bindings, bool)> {
         }
         Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
     }
+}
+
+pub fn load(path: &Path) -> Result<Bindings> {
+    match fs::read(path) {
+        Ok(bytes) => {
+            let bindings: Bindings = serde_json::from_slice(&bytes)
+                .with_context(|| format!("failed to parse {}", path.display()))?;
+            bindings.validate()?;
+            Ok(bindings)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Bindings::default()),
+        Err(error) => Err(error).with_context(|| format!("failed to read {}", path.display())),
+    }
+}
+
+pub fn save(path: &Path, bindings: &Bindings) -> Result<()> {
+    bindings.validate()?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let mut bytes = serde_json::to_vec_pretty(bindings)?;
+    bytes.push(b'\n');
+    fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))
 }
 
 impl Bindings {
@@ -246,8 +270,30 @@ pub fn vk_for_name(value: &str) -> Option<u16> {
         "win" | "windows" | "meta" | "super" => 0x5B,
         "enter" | "return" => 0x0D,
         "esc" | "escape" => 0x1B,
+        "backspace" => 0x08,
         "tab" => 0x09,
         "space" => 0x20,
+        "minus" => 0xBD,
+        "equal" => 0xBB,
+        "leftbracket" | "left-bracket" => 0xDB,
+        "rightbracket" | "right-bracket" => 0xDD,
+        "backslash" => 0xDC,
+        "semicolon" => 0xBA,
+        "quote" => 0xDE,
+        "grave" | "backtick" => 0xC0,
+        "comma" => 0xBC,
+        "period" | "dot" => 0xBE,
+        "slash" => 0xBF,
+        "capslock" | "caps-lock" => 0x14,
+        "printscreen" | "print-screen" => 0x2C,
+        "scrolllock" | "scroll-lock" => 0x91,
+        "pause" => 0x13,
+        "insert" => 0x2D,
+        "home" => 0x24,
+        "pageup" | "page-up" | "pgup" => 0x21,
+        "delete" | "del" => 0x2E,
+        "end" => 0x23,
+        "pagedown" | "page-down" | "pgdn" => 0x22,
         "left" | "left-arrow" => 0x25,
         "up" | "up-arrow" => 0x26,
         "right" | "right-arrow" => 0x27,
@@ -266,7 +312,7 @@ pub fn vk_for_name(value: &str) -> Option<u16> {
 fn is_extended_vk(vk: u16) -> bool {
     matches!(
         vk,
-        0x25..=0x28 | 0x5B..=0x5C | 0xAD..=0xB3
+        0x21..=0x2E | 0x5B..=0x5C | 0xAD..=0xB3
     )
 }
 

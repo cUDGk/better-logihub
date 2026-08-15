@@ -38,8 +38,8 @@ G HUB の設定データベースからプロファイル (DPI テーブル・�
 | 特殊キー一覧・divert・remap | `logihub keys list` / `keys divert ...` | 0x1B04 |
 | HID++ 入力イベント監視 | `logihub watch --device 3` | 0x8010 / 0x8020 / 0x8030 / 0x1B04 |
 | G キー・特殊キー常駐割り当て | `logihub daemon` | HID++ 通知 + Windows SendInput |
-| G HUB プロファイル移行 | `logihub profile import-ghub` | settings.db (SQLite) |
-| プロファイル適用 | `logihub profile apply Desktop` | — |
+| G HUB 設定の完全移行 | `logihub profile import-ghub` | settings.db (SQLite + JSON) |
+| プロファイル表示・適用 | `logihub profile show` / `profile apply Desktop` | DPI / rate / 0x8071 / 0x8100 |
 | オンボードボタン / G キー割り当て | `logihub onboard set-button` / `set-gkey` | 0x8100 |
 | オンボードマクロ作成・一覧 | `logihub onboard macro set` / `macro list` | 0x8100 |
 | 起動時 LED スロット | `logihub onboard led show` / `led set` | 0x8100 |
@@ -91,8 +91,10 @@ logihub battery
 # DPI を 3200 に (デバイスが複数あるときは --device <番号>)
 logihub dpi set 3200 --device 1
 
-# G HUB から設定を移行してから適用
+# G HUB から設定を移行して内容を確認してから適用
+logihub profile import-ghub --dry-run
 logihub profile import-ghub
+logihub profile show Desktop
 logihub profile apply Desktop --device 1
 
 # キーボードの明るさ (割合またはデバイス生値)
@@ -201,6 +203,43 @@ logihub onboard set-name "Desktop" --device 1
 # 保存済みオンボードマクロを指定位置から実行
 logihub onboard exec-macro 6 0 --device 1
 ```
+
+### G HUB settings.db の完全インポート
+
+`profile import-ghub` は `data` テーブル内の単一 JSON を読み、プロファイル、アプリケーション、カード参照、ボタン / G キー割り当て、マクロ、DPI、レポートレート、ファームウェア照明をまとめて変換します。既定の入力は `%LOCALAPPDATA%\LGHUB\settings.db`、既定の出力先は `%APPDATA%\better-logihub` です。
+
+```bash
+# 書き込みなしで全警告と生成予定ファイルを確認
+logihub profile import-ghub --dry-run
+
+# バックアップ DB、出力先、対象機種を明示
+logihub profile import-ghub \
+  --db C:\backup\settings.db \
+  --out-dir C:\backup\converted \
+  --device-model g502x-lightspeed
+
+logihub profile list
+logihub profile show Desktop
+
+# live 適用: DPI、レポートレート、ファームウェア照明
+logihub profile apply Desktop --device 1
+
+# オンボード適用: Phase D と同じ CRC / 差分 / バックアップ検査を通す
+logihub profile apply Desktop --device 1 --onboard --yes
+
+# 生成された portable onboard JSON も通常の import 経路で検証・適用できる
+logihub onboard import --in converted\onboard\desktop--g502x_lightspeed.json --device 1 --dry-run
+logihub onboard import --in converted\onboard\desktop--g502x_lightspeed.json --device 1 --yes
+```
+
+出力は次のとおりです。
+
+- `profiles.json`: 既存 schema version 1 を保ち、プロファイル別の割り当て、マクロ、照明を追加
+- `bindings.json`: daemon が実行できる G キー / CID の keystroke、text、media、run、macro
+- `onboard/*.json`: 対応機種用の DPI index、レート、割り当て、オンボード可能なマクロ、LED スロット
+- `rgb/*.json`: `logihub rgb set` の引数として使えるファームウェア照明プリセット
+
+G HUB 組み込みカード ID は DB 内に実体がなくても復号します。`g502x_lightspeed` と `g502x-lightspeed` は同一機種として扱い、`sequences` / `sequence` の両方を受け付けます。device depot にしか存在しない既定割り当て、物理 CID を DB から特定できない入力、layout-A に格納できないアクションは推測せず、unassigned または NOOP として理由を警告します。
 
 プロファイルは `%APPDATA%\better-logihub\profiles.json` に保存されます。
 

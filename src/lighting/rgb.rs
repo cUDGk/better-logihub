@@ -104,6 +104,7 @@ impl Effect {
             }
             "snipe_pulse" => ("snipe_pulse", 0x11, Layout::DualColor),
             "neural_wave" => ("neural_wave", 0x12, Layout::DualColor),
+            "streaming" => ("streaming", 0x13, Layout::None),
             "color_cycle_s" | "cycle_s" => ("color_cycle_s", 0x15, Layout::ColorCycleS),
             "colorwave_s" | "color_wave_s" => ("colorwave_s", 0x16, Layout::ColorWaveS),
             "ripple_s" => ("ripple_s", 0x17, Layout::RippleS),
@@ -116,7 +117,7 @@ impl Effect {
             "signature_hardcoded_active" => ("signature_hardcoded_active", 0x1A, Layout::None),
             "signature_hardcoded_inactive" => ("signature_hardcoded_inactive", 0x1B, Layout::None),
             _ => bail!(
-                "unknown RGB effect {value:?}; use off, fixed, breathing, cycle, colorwave, ripple, custom, kitt, decomposition, color_cycle_s, colorwave_s, ripple_s, or a signature effect name"
+                "unknown RGB effect {value:?}; use off, fixed, breathing, cycle, colorwave, ripple, custom, kitt, decomposition, streaming, color_cycle_s, colorwave_s, ripple_s, or a signature effect name"
             ),
         };
         Ok(Self {
@@ -763,6 +764,7 @@ mod tests {
         assert_eq!(effect("OFF").raw_id, 0x00);
         assert_eq!(effect("fixed").raw_id, 0x01);
         assert_eq!(effect("COLORWAVE_S").raw_id, 0x16);
+        assert_eq!(effect("STREAMING").raw_id, 0x13);
         assert_eq!(effect("signature-algorithmic-active").raw_id, 0x18);
     }
 
