@@ -40,7 +40,11 @@ G HUB の設定データベースからプロファイル (DPI テーブル・�
 | G キー・特殊キー常駐割り当て | `logihub daemon` | HID++ 通知 + Windows SendInput |
 | G HUB プロファイル移行 | `logihub profile import-ghub` | settings.db (SQLite) |
 | プロファイル適用 | `logihub profile apply Desktop` | — |
-| オンボードボタン割り当て | `logihub buttons set 7 key:ctrl+c` | 0x8100 |
+| オンボードボタン / G キー割り当て | `logihub onboard set-button` / `set-gkey` | 0x8100 |
+| オンボードマクロ作成・一覧 | `logihub onboard macro set` / `macro list` | 0x8100 |
+| 起動時 LED スロット | `logihub onboard led show` / `led set` | 0x8100 |
+| オンボード JSON export / import | `logihub onboard export` / `import` | 0x8100 |
+| オンボード / host mode | `logihub onboard mode get` / `mode set on` | 0x8100 |
 | オンボード DPI テーブル / レート | `logihub onboard set-dpi` / `set-rate` | 0x8100 |
 | アクティブ DPI スロット固定 | `logihub onboard set-dpi-index 3` | 0x8100 |
 | オンボードメモリの dump / restore | `logihub onboard dump` / `restore` | 0x8100 |
@@ -156,6 +160,31 @@ logihub onboard dump --out backup.bin --device 1   # 書き込み前のバック
 logihub buttons set 7 key:ctrl+c --device 1
 logihub buttons set 11 key:win+l --device 1
 logihub buttons list --device 1
+logihub onboard set-button 7 key:f5 --device 1     # onboard 配下でも同じ操作
+
+# G913 の G キー。通常 bank と G-Shift bank の両方を扱う
+logihub onboard set-gkey 1 key:ctrl+shift+c --device 3
+logihub onboard set-gkey 2 key:volume-up --gshift --device 3
+
+# オンボードマクロ。key は押下+解放、text は ASCII をキー列へ変換する
+logihub onboard macro list --device 3
+logihub onboard macro set 3 --device 3 --steps '[{"key":"ctrl+c"},{"delay_ms":100},{"text":"hi"},{"consumer":"volume_up"}]'
+logihub onboard macro show 4 0 --device 3
+logihub onboard macro clear 3 --device 3
+
+# プロファイルに保存される 4 個の起動時 LED スロット (slot は 0〜3)
+logihub onboard led show --device 3
+logihub onboard led set 0 --effect fixed --color 00FF40 --device 3
+logihub onboard led set 1 --effect colorwave --period 5000 --direction horizontal --device 3
+
+# オンボード / host mode を明示的に確認・変更 (on=onboard、off=host)
+logihub onboard mode get --device 3
+logihub onboard mode set on --device 3
+
+# 全 sector と decoded profile/macro/LED を JSON 化
+logihub onboard export --device 1 --out profile.json
+logihub onboard import --device 1 --in profile.json --dry-run  # 常に先に差分確認
+logihub onboard import --device 1 --in profile.json --yes      # 差分表示後にだけ書く
 
 # DPI テーブルとレートもオンボード化 (電源を切っても残る)
 logihub onboard set-dpi 800 1200 1600 4000 7000 --default 3 --shift 800 --device 1
@@ -224,11 +253,13 @@ logihub daemon --config C:\path\bindings.json --verbose
 
 ## 制限事項
 
-- ボタン割り当てはオンボードメモリ書き込みで対応 (`buttons set`)。キーストローク・マウスボタン・特殊操作・既存マクロ参照を割り当て可能。マクロ作成は対象外
+- 0x8100 layout A (profile format 1〜5) のボタン / G キー、両 G-Shift bank、マクロ、プロファイル名、DPI、レート、LED スロットを扱います。layout B (format 6〜9) は未対応です
+- オンボードマクロの `text` は USB HID の US 配列へ確定変換できる ASCII のみです。日本語などの Unicode 文字列は host mode の daemon を使ってください
 - `rgb set` の既定は RAM (`--persist ram`)。`nvm` と `powersave` は不揮発領域へ書くため、意図した場合だけ指定してください
 - 0x8081 の zone-id は機種ごとに HID usage 方式と Solaar 方式の候補があります。`data/devices.json` に `zone_scheme` がない機種では `--zone-scheme hidusage|solaar` が必須です。`perkey probe` は観察結果を表示するだけで自動保存・自動判定しません
 - `perkey frame --from` は `{"a":"FF0000","esc":"00FF00"}` 形式です。`--persist` を付けない限り RAM フレームだけを書きます
-- オンボード書き込みは毎回「事前バックアップ必須 → CRC 検証 → 書き込み → 読み戻し照合」を通ります。壊れたら `onboard restore` で戻せます
+- オンボード書き込みは毎回「事前バックアップ必須 → CRC 検証 → 書き込み → GetCRC または読み戻し照合」を通ります。`onboard dump` は directory、全 profile、全 macro sector を保存し、壊れたら `onboard restore` で戻せます
+- `onboard import` は書き込み前に sector 単位の差分を必ず表示します。`--dry-run` は一切書かず、実書き込みには `--yes` が必須です
 - 電源オフ / スリープ中の無線デバイスは `unreachable` と表示されます (レシーバーの仕様)
 - `gkeys info` の physical layout は仕様上「layout id」か「物理 G-key bitmask」か未確定のため、解釈せず raw BE16 として表示します
 - `bindings.json` は標準の press/release edge と単純 macro step を扱う軽量モデルです。G-Shift、M1〜M3、FN ごとの別 assignment map、hold/double-click/toggle/repeat macro は未実装です

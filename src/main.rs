@@ -12,6 +12,7 @@ mod output;
 mod profile;
 mod specialkeys;
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -36,9 +37,11 @@ use lighting::rgb::{
     parse_direction,
 };
 use onboard::{
-    ButtonRow, Description as OnboardDescription, DirectoryEntry, Onboard, backup_path,
-    button_rows, encode_dump, first_enabled_sector, load_dump, parse_binding, profile_name,
-    require_backup, save_dump, set_button as set_onboard_button, set_dpi as set_onboard_dpi,
+    Binding as OnboardBinding, ButtonRow, Description as OnboardDescription, DirectoryEntry, Macro,
+    Onboard, SectorDiff, VerificationMethod, backup_path, button_rows, decode_macro, encode_dump,
+    export_state, first_enabled_sector, import_plan, led_slots, load_dump, load_export,
+    macro_sector_ids, parse_binding, profile_name, repack_export_macros, require_backup, save_dump,
+    save_export, set_button as set_onboard_button, set_dpi as set_onboard_dpi, set_led_slot,
     set_profile_name, set_rate as set_onboard_rate,
 };
 use output::{print_json, print_table};
@@ -436,6 +439,24 @@ enum OnboardCommand {
         #[arg(long)]
         device: Option<usize>,
     },
+    /// Export the complete onboard state as editable JSON.
+    Export {
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        device: Option<usize>,
+    },
+    /// Import onboard JSON after showing a sector diff.
+    Import {
+        #[arg(long = "in")]
+        input: PathBuf,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, conflicts_with = "dry_run")]
+        yes: bool,
+        #[arg(long)]
+        device: Option<usize>,
+    },
     GetName {
         #[arg(long)]
         device: Option<usize>,
@@ -486,8 +507,119 @@ enum OnboardCommand {
         #[arg(long)]
         device: Option<usize>,
     },
+    /// Set a normal or G-Shift button-table entry.
+    SetButton {
+        n: usize,
+        binding: String,
+        #[arg(long)]
+        gshift: bool,
+        #[arg(long)]
+        device: Option<usize>,
+    },
+    /// Keyboard-flavoured alias of set-button.
+    SetGkey {
+        n: usize,
+        binding: String,
+        #[arg(long)]
+        gshift: bool,
+        #[arg(long)]
+        device: Option<usize>,
+    },
+    /// Inspect or edit onboard macro bytecode.
+    Macro {
+        #[command(subcommand)]
+        command: OnboardMacroCommand,
+    },
+    /// Inspect or edit the four startup LED slots in the active profile.
+    Led {
+        #[command(subcommand)]
+        command: OnboardLedCommand,
+    },
     Mode {
-        mode: OnboardMode,
+        #[command(subcommand)]
+        command: OnboardModeCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OnboardMacroCommand {
+    List {
+        #[arg(long)]
+        device: Option<usize>,
+    },
+    Show {
+        #[arg(value_parser = parse_u16_arg)]
+        sector: u16,
+        #[arg(value_parser = parse_u16_arg)]
+        offset: u16,
+        #[arg(long)]
+        device: Option<usize>,
+    },
+    Set {
+        n: usize,
+        #[arg(long)]
+        gshift: bool,
+        #[arg(long)]
+        steps: String,
+        #[arg(long)]
+        device: Option<usize>,
+    },
+    Clear {
+        n: usize,
+        #[arg(long)]
+        gshift: bool,
+        #[arg(long)]
+        device: Option<usize>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OnboardLedCommand {
+    Show {
+        #[arg(long)]
+        device: Option<usize>,
+    },
+    Set {
+        slot: usize,
+        #[arg(long)]
+        effect: String,
+        #[arg(long)]
+        color: Option<String>,
+        #[arg(long)]
+        color2: Option<String>,
+        #[arg(long)]
+        speed: Option<u16>,
+        #[arg(long)]
+        period: Option<u16>,
+        #[arg(long)]
+        brightness: Option<u8>,
+        #[arg(long)]
+        intensity: Option<u8>,
+        #[arg(long)]
+        direction: Option<String>,
+        #[arg(long)]
+        device: Option<usize>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum OnboardModeCommand {
+    Get {
+        #[arg(long)]
+        device: Option<usize>,
+    },
+    Set {
+        state: OnOff,
+        #[arg(long)]
+        device: Option<usize>,
+    },
+    /// Legacy alias for `mode set on`.
+    Onboard {
+        #[arg(long)]
+        device: Option<usize>,
+    },
+    /// Legacy alias for `mode set off`.
+    Host {
         #[arg(long)]
         device: Option<usize>,
     },
@@ -507,21 +639,6 @@ enum ButtonsCommand {
         #[arg(long)]
         device: Option<usize>,
     },
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum OnboardMode {
-    Onboard,
-    Host,
-}
-
-impl OnboardMode {
-    fn value(self) -> u8 {
-        match self {
-            Self::Onboard => 0x01,
-            Self::Host => 0x02,
-        }
-    }
 }
 
 #[derive(Serialize)]
@@ -773,6 +890,13 @@ fn main() -> Result<()> {
         Command::Onboard { command } => match command {
             OnboardCommand::Info { device } => onboard_info(device, cli.json),
             OnboardCommand::Dump { out, device } => onboard_dump(&out, device, cli.json),
+            OnboardCommand::Export { out, device } => onboard_export(&out, device, cli.json),
+            OnboardCommand::Import {
+                input,
+                dry_run,
+                yes,
+                device,
+            } => onboard_import(&input, dry_run, yes, device, cli.json),
             OnboardCommand::GetName { device } => onboard_get_name(device, cli.json),
             OnboardCommand::SetName { name, device } => onboard_set_name(&name, device, cli.json),
             OnboardCommand::Crc { sector, device } => onboard_crc(sector, device, cli.json),
@@ -792,7 +916,70 @@ fn main() -> Result<()> {
             OnboardCommand::SetDpiIndex { index, device } => {
                 onboard_set_dpi_index(index, device, cli.json)
             }
-            OnboardCommand::Mode { mode, device } => onboard_mode(mode, device, cli.json),
+            OnboardCommand::SetButton {
+                n,
+                binding,
+                gshift,
+                device,
+            } => buttons_set(n, &binding, gshift, device, cli.json, false),
+            OnboardCommand::SetGkey {
+                n,
+                binding,
+                gshift,
+                device,
+            } => buttons_set(n, &binding, gshift, device, cli.json, true),
+            OnboardCommand::Macro { command } => match command {
+                OnboardMacroCommand::List { device } => onboard_macro_list(device, cli.json),
+                OnboardMacroCommand::Show {
+                    sector,
+                    offset,
+                    device,
+                } => onboard_macro_show(sector, offset, device, cli.json),
+                OnboardMacroCommand::Set {
+                    n,
+                    gshift,
+                    steps,
+                    device,
+                } => onboard_macro_set(n, gshift, &steps, device, cli.json),
+                OnboardMacroCommand::Clear { n, gshift, device } => {
+                    onboard_macro_clear(n, gshift, device, cli.json)
+                }
+            },
+            OnboardCommand::Led { command } => match command {
+                OnboardLedCommand::Show { device } => onboard_led_show(device, cli.json),
+                OnboardLedCommand::Set {
+                    slot,
+                    effect,
+                    color,
+                    color2,
+                    speed,
+                    period,
+                    brightness,
+                    intensity,
+                    direction,
+                    device,
+                } => onboard_led_set(
+                    slot,
+                    &effect,
+                    color.as_deref(),
+                    color2.as_deref(),
+                    speed,
+                    period,
+                    brightness,
+                    intensity,
+                    direction.as_deref(),
+                    device,
+                    cli.json,
+                ),
+            },
+            OnboardCommand::Mode { command } => match command {
+                OnboardModeCommand::Get { device } => onboard_mode_get(device, cli.json),
+                OnboardModeCommand::Set { state, device } => {
+                    onboard_mode_set(state.enabled(), device, cli.json)
+                }
+                OnboardModeCommand::Onboard { device } => onboard_mode_set(true, device, cli.json),
+                OnboardModeCommand::Host { device } => onboard_mode_set(false, device, cli.json),
+            },
         },
         Command::Buttons { command } => match command {
             ButtonsCommand::List { device } => buttons_list(device, cli.json),
@@ -801,7 +988,7 @@ fn main() -> Result<()> {
                 binding,
                 gshift,
                 device,
-            } => buttons_set(n, &binding, gshift, device, cli.json),
+            } => buttons_set(n, &binding, gshift, device, cli.json, false),
         },
         Command::Brightness { command, device } => {
             let discovery = discover_with_warnings()?;
@@ -2507,7 +2694,169 @@ fn onboard_dump(out: &std::path::Path, index: Option<usize>, json: bool) -> Resu
         operation: format!("dump {sector_count} sectors to {}", out.display()),
         status: "saved and registered as safety backup".into(),
     };
+    print_onboard_result(result, json)?;
+    if !json {
+        let export = export_state(&dump, device_kind(target))?;
+        let rows = export
+            .profiles
+            .iter()
+            .flat_map(macro_rows)
+            .collect::<Vec<_>>();
+        if !rows.is_empty() {
+            println!("decoded macro bindings:");
+            let table = rows
+                .iter()
+                .map(|row| {
+                    vec![
+                        row["profile"].as_str().unwrap().to_owned(),
+                        row["control"].as_str().unwrap().to_owned(),
+                        row["gshift"].as_bool().unwrap().to_string(),
+                        row["sector"].as_str().unwrap().to_owned(),
+                        row["offset"].as_str().unwrap().to_owned(),
+                        row["steps"].to_string(),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            print_table(
+                &["PROFILE", "CONTROL", "G-SHIFT", "SECTOR", "OFFSET", "STEPS"],
+                &table,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn onboard_export(out: &std::path::Path, index: Option<usize>, json: bool) -> Result<()> {
+    let discovery = discover_with_warnings()?;
+    let target = single_device(&discovery, index)?;
+    let onboard = Onboard::new(&target.device)?;
+    let dump = onboard.dump()?;
+    let export = export_state(&dump, device_kind(target))?;
+    save_export(out, &export)?;
+    let result = OnboardWriteResult {
+        device: target.index,
+        name: target.name.clone(),
+        operation: format!(
+            "export {} profiles and {} macro sectors to {}",
+            export.profiles.len(),
+            export.macro_sectors.len(),
+            out.display()
+        ),
+        status: "saved (read-only)".into(),
+    };
     print_onboard_result(result, json)
+}
+
+fn onboard_import(
+    input: &std::path::Path,
+    dry_run: bool,
+    yes: bool,
+    index: Option<usize>,
+    json: bool,
+) -> Result<()> {
+    let exported = load_export(input)?;
+    let discovery = discover_with_warnings()?;
+    let target = single_device(&discovery, index)?;
+    let onboard = Onboard::new(&target.device)?;
+    let current = onboard.dump()?;
+    let diffs = import_plan(&exported, &current, device_kind(target))?;
+    print_sector_diff(&diffs, dry_run, json)?;
+    if dry_run || diffs.is_empty() {
+        return Ok(());
+    }
+    ensure!(
+        yes,
+        "{} differing sectors; refusing to write without --yes (use --dry-run to validate only)",
+        diffs.len()
+    );
+    require_backup(&current.description)?;
+    let methods = write_sector_diffs(
+        &onboard,
+        &current.description,
+        &exported.directory.entries,
+        &diffs,
+    )?;
+    let status = verification_summary(&methods);
+    print_onboard_result(
+        OnboardWriteResult {
+            device: target.index,
+            name: target.name.clone(),
+            operation: format!("import {} sectors from {}", diffs.len(), input.display()),
+            status,
+        },
+        json,
+    )
+}
+
+fn print_sector_diff(diffs: &[SectorDiff], dry_run: bool, json: bool) -> Result<()> {
+    if json {
+        return print_json(&serde_json::json!({
+            "dry_run": dry_run,
+            "differing_sector_count": diffs.len(),
+            "diffs": diffs.iter().map(|diff| serde_json::json!({
+                "sector": diff.sector,
+                "current_crc": diff.current_crc,
+                "replacement_crc": diff.replacement_crc,
+            })).collect::<Vec<_>>(),
+        }));
+    }
+    println!("{} differing sectors", diffs.len());
+    if !diffs.is_empty() {
+        let rows = diffs
+            .iter()
+            .map(|diff| {
+                vec![
+                    format!("0x{:04X}", diff.sector),
+                    format!("0x{:04X}", diff.current_crc),
+                    format!("0x{:04X}", diff.replacement_crc),
+                ]
+            })
+            .collect::<Vec<_>>();
+        print_table(&["SECTOR", "CURRENT CRC", "IMPORTED CRC"], &rows);
+    }
+    if dry_run {
+        println!("dry-run: no sectors written");
+    }
+    Ok(())
+}
+
+fn write_sector_diffs(
+    onboard: &Onboard<'_>,
+    description: &OnboardDescription,
+    entries: &[DirectoryEntry],
+    diffs: &[SectorDiff],
+) -> Result<Vec<VerificationMethod>> {
+    let macro_ids = macro_sector_ids(description, entries)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let ordered = diffs
+        .iter()
+        .filter(|diff| macro_ids.contains(&diff.sector))
+        .chain(
+            diffs
+                .iter()
+                .filter(|diff| diff.sector != 0 && !macro_ids.contains(&diff.sector)),
+        )
+        .chain(diffs.iter().filter(|diff| diff.sector == 0));
+    ordered
+        .map(|diff| {
+            onboard.write_sector_verified(
+                diff.sector,
+                &diff.current,
+                &diff.replacement,
+                diff.sector == 0,
+            )
+        })
+        .collect()
+}
+
+fn verification_summary(methods: &[VerificationMethod]) -> String {
+    let get_crc = methods
+        .iter()
+        .filter(|method| **method == VerificationMethod::GetCrc)
+        .count();
+    let read_back = methods.len() - get_crc;
+    format!("verified: GetCRC {get_crc}, read-back {read_back}")
 }
 
 fn onboard_get_name(index: Option<usize>, json: bool) -> Result<()> {
@@ -2646,7 +2995,11 @@ fn buttons_list(index: Option<usize>, json: bool) -> Result<()> {
     let (_, entries) = onboard.directory(&description)?;
     let sector_id = first_enabled_sector(&entries)?;
     let sector = onboard.read_sector(sector_id, description.sector_size)?;
-    let rows = button_rows(&sector)?;
+    let rows = button_rows(
+        &sector,
+        description.button_count,
+        device_kind(target) == "KEYBOARD",
+    )?;
     if json {
         return print_json(&rows);
     }
@@ -2660,10 +3013,15 @@ fn buttons_set(
     gshift: bool,
     index: Option<usize>,
     json: bool,
+    require_keyboard: bool,
 ) -> Result<()> {
     let binding = parse_binding(value)?;
     let discovery = discover_with_warnings()?;
     let target = single_device(&discovery, index)?;
+    ensure!(
+        !require_keyboard || device_kind(target) == "KEYBOARD",
+        "set-gkey requires a device classified as KEYBOARD"
+    );
     let onboard = Onboard::new(&target.device)?;
     let description = onboard.description()?;
     require_backup(&description)?;
@@ -2684,10 +3042,271 @@ fn buttons_set(
             device: target.index,
             name: target.name.clone(),
             operation: format!(
-                "set {}G{number} to {binding}",
-                if gshift { "G-Shift " } else { "" }
+                "set {}{} to {binding}",
+                if gshift { "G-Shift " } else { "" },
+                if device_kind(target) == "KEYBOARD" {
+                    format!("g{number}")
+                } else {
+                    format!("button {number}")
+                }
             ),
             status: "verified".into(),
+        },
+        json,
+    )
+}
+
+fn onboard_macro_list(index: Option<usize>, json: bool) -> Result<()> {
+    let discovery = discover_with_warnings()?;
+    let target = single_device(&discovery, index)?;
+    let onboard = Onboard::new(&target.device)?;
+    let export = export_state(&onboard.dump()?, device_kind(target))?;
+    let rows = export
+        .profiles
+        .iter()
+        .flat_map(macro_rows)
+        .collect::<Vec<_>>();
+    if json {
+        return print_json(&rows);
+    }
+    let table = rows
+        .iter()
+        .map(|row| {
+            vec![
+                row["profile"].as_str().unwrap().to_owned(),
+                row["control"].as_str().unwrap().to_owned(),
+                row["gshift"].as_bool().unwrap().to_string(),
+                row["sector"].as_str().unwrap().to_owned(),
+                row["offset"].as_str().unwrap().to_owned(),
+                row["steps"].to_string(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    print_table(
+        &["PROFILE", "CONTROL", "G-SHIFT", "SECTOR", "OFFSET", "STEPS"],
+        &table,
+    );
+    Ok(())
+}
+
+fn macro_rows(profile: &onboard::ExportProfile) -> Vec<serde_json::Value> {
+    [(false, &profile.bindings), (true, &profile.gshift_bindings)]
+        .into_iter()
+        .flat_map(|(gshift, bindings)| {
+            bindings.iter().filter_map(move |binding| {
+                let OnboardBinding::Macro { sector, offset } =
+                    parse_binding(&binding.binding).ok()?
+                else {
+                    return None;
+                };
+                Some(serde_json::json!({
+                    "profile": format!("{}{}", profile.index, profile.name.as_deref().map_or(String::new(), |name| format!(" ({name})"))),
+                    "control": binding.control,
+                    "number": binding.number,
+                    "gshift": gshift,
+                    "sector": format!("0x{sector:04X}"),
+                    "offset": format!("0x{offset:04X}"),
+                    "steps": binding.r#macro.as_ref().map(|value| &value.steps),
+                }))
+            })
+        })
+        .collect()
+}
+
+fn onboard_macro_show(sector: u16, offset: u16, index: Option<usize>, json: bool) -> Result<()> {
+    let discovery = discover_with_warnings()?;
+    let target = single_device(&discovery, index)?;
+    let onboard = Onboard::new(&target.device)?;
+    let dump = onboard.dump()?;
+    let directory = dump
+        .sectors
+        .iter()
+        .find(|(id, _)| *id == 0)
+        .map(|(_, bytes)| bytes)
+        .context("directory sector was not read")?;
+    let entries = onboard::parse_directory(directory, dump.description.profile_count)?;
+    let macro_ids = macro_sector_ids(&dump.description, &entries)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let sectors = dump.sectors.into_iter().collect::<BTreeMap<_, _>>();
+    let value = decode_macro(&sectors, &macro_ids, sector, offset)?;
+    if json {
+        return print_json(&value);
+    }
+    println!("macro 0x{sector:04X}:0x{offset:04X}");
+    println!("{}", serde_json::to_string_pretty(&value.steps)?);
+    Ok(())
+}
+
+fn onboard_macro_set(
+    number: usize,
+    gshift: bool,
+    steps: &str,
+    index: Option<usize>,
+    json: bool,
+) -> Result<()> {
+    let value = Macro::from_steps_json(steps)?;
+    edit_onboard_macro(number, gshift, Some(value), index, json)
+}
+
+fn onboard_macro_clear(
+    number: usize,
+    gshift: bool,
+    index: Option<usize>,
+    json: bool,
+) -> Result<()> {
+    edit_onboard_macro(number, gshift, None, index, json)
+}
+
+fn edit_onboard_macro(
+    number: usize,
+    gshift: bool,
+    value: Option<Macro>,
+    index: Option<usize>,
+    json: bool,
+) -> Result<()> {
+    let discovery = discover_with_warnings()?;
+    let target = single_device(&discovery, index)?;
+    let onboard = Onboard::new(&target.device)?;
+    let current = onboard.dump()?;
+    require_backup(&current.description)?;
+    let mut export = export_state(&current, device_kind(target))?;
+    let macro_sector = *macro_sector_ids(&export.description, &export.directory.entries)?
+        .first()
+        .unwrap();
+    ensure!(number > 0, "control number starts at 1");
+    let (control, is_set) = {
+        let profile = export
+            .profiles
+            .iter_mut()
+            .find(|profile| profile.enabled)
+            .context("profile directory has no enabled profile")?;
+        let bindings = if gshift {
+            &mut profile.gshift_bindings
+        } else {
+            &mut profile.bindings
+        };
+        let count = bindings.len();
+        let binding = bindings.get_mut(number - 1).with_context(|| {
+            format!(
+                "{} number must be 1..={count}",
+                if device_kind(target) == "KEYBOARD" {
+                    "G-key"
+                } else {
+                    "button"
+                }
+            )
+        })?;
+        if let Some(value) = value {
+            binding.binding = OnboardBinding::Macro {
+                sector: macro_sector,
+                offset: 0,
+            }
+            .to_string();
+            binding.r#macro = Some(value);
+        } else {
+            binding.binding = OnboardBinding::Disabled.to_string();
+            binding.raw_hex = "FF000000".into();
+            binding.r#macro = None;
+        }
+        (binding.control.clone(), binding.r#macro.is_some())
+    };
+    repack_export_macros(&mut export)?;
+    let diffs = import_plan(&export, &current, device_kind(target))?;
+    let methods = write_sector_diffs(
+        &onboard,
+        &current.description,
+        &export.directory.entries,
+        &diffs,
+    )?;
+    print_onboard_result(
+        OnboardWriteResult {
+            device: target.index,
+            name: target.name.clone(),
+            operation: format!(
+                "{} {}{}",
+                if is_set {
+                    "set macro on"
+                } else {
+                    "clear macro from"
+                },
+                if gshift { "G-Shift " } else { "" },
+                control
+            ),
+            status: verification_summary(&methods),
+        },
+        json,
+    )
+}
+
+fn onboard_led_show(index: Option<usize>, json: bool) -> Result<()> {
+    let discovery = discover_with_warnings()?;
+    let target = single_device(&discovery, index)?;
+    let onboard = Onboard::new(&target.device)?;
+    let description = onboard.description()?;
+    let (_, entries) = onboard.directory(&description)?;
+    let sector_id = first_enabled_sector(&entries)?;
+    let sector = onboard.read_sector(sector_id, description.sector_size)?;
+    let slots = led_slots(&sector)?;
+    if json {
+        return print_json(&slots);
+    }
+    let rows = slots
+        .iter()
+        .map(|slot| {
+            vec![
+                slot.slot.to_string(),
+                slot.effect.clone(),
+                format!("0x{:02X}", slot.raw_id),
+                slot.parameters_hex.clone(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    print_table(&["SLOT", "EFFECT", "RAW ID", "PARAMETERS"], &rows);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn onboard_led_set(
+    slot: usize,
+    effect_name: &str,
+    color: Option<&str>,
+    color2: Option<&str>,
+    speed: Option<u16>,
+    period: Option<u16>,
+    brightness: Option<u8>,
+    intensity: Option<u8>,
+    direction: Option<&str>,
+    index: Option<usize>,
+    json: bool,
+) -> Result<()> {
+    let effect = Effect::parse(effect_name)?;
+    let options = EffectOptions {
+        color: color.map(str::parse).transpose()?,
+        color2: color2.map(str::parse).transpose()?,
+        speed,
+        period_ms: period,
+        brightness,
+        intensity,
+        direction: direction.map(parse_direction).transpose()?,
+    };
+    let discovery = discover_with_warnings()?;
+    let target = single_device(&discovery, index)?;
+    let onboard = Onboard::new(&target.device)?;
+    let description = onboard.description()?;
+    require_backup(&description)?;
+    let (_, entries) = onboard.directory(&description)?;
+    let sector_id = first_enabled_sector(&entries)?;
+    let original = onboard.read_sector(sector_id, description.sector_size)?;
+    let mut replacement = original.clone();
+    set_led_slot(&mut replacement, slot, effect, &options)?;
+    let method = onboard.write_sector_verified(sector_id, &original, &replacement, false)?;
+    print_onboard_result(
+        OnboardWriteResult {
+            device: target.index,
+            name: target.name.clone(),
+            operation: format!("set onboard LED slot {slot} to {}", effect.name),
+            status: format!("verified by {method}"),
         },
         json,
     )
@@ -2770,18 +3389,38 @@ fn onboard_set_rate(hz: u32, index: Option<usize>, json: bool) -> Result<()> {
     )
 }
 
-fn onboard_mode(mode: OnboardMode, index: Option<usize>, json: bool) -> Result<()> {
+fn onboard_mode_get(index: Option<usize>, json: bool) -> Result<()> {
+    let discovery = discover_with_warnings()?;
+    let target = single_device(&discovery, index)?;
+    let onboard = Onboard::new(&target.device)?;
+    let mode = mode_name(onboard.mode()?);
+    if json {
+        return print_json(&serde_json::json!({
+            "device": target.index,
+            "name": target.name,
+            "mode": mode,
+        }));
+    }
+    print_table(
+        &["DEVICE", "NAME", "MODE"],
+        &[vec![target.index.to_string(), target.name.clone(), mode]],
+    );
+    Ok(())
+}
+
+fn onboard_mode_set(onboard_mode: bool, index: Option<usize>, json: bool) -> Result<()> {
     let discovery = discover_with_warnings()?;
     let target = single_device(&discovery, index)?;
     let onboard = Onboard::new(&target.device)?;
     let description = onboard.description()?;
     require_backup(&description)?;
-    onboard.set_mode(mode.value())?;
+    let mode = if onboard_mode { 0x01 } else { 0x02 };
+    onboard.set_mode(mode)?;
     print_onboard_result(
         OnboardWriteResult {
             device: target.index,
             name: target.name.clone(),
-            operation: format!("set mode to {}", mode_name(mode.value())),
+            operation: format!("set mode to {}", mode_name(mode)),
             status: "verified".into(),
         },
         json,
@@ -2826,6 +3465,10 @@ fn mode_name(mode: u8) -> String {
         0x02 => "host".into(),
         _ => format!("unknown (0x{mode:02X})"),
     }
+}
+
+fn device_kind(target: &ManagedDevice) -> &str {
+    target.model.map_or("UNKNOWN", |model| model.kind.as_str())
 }
 
 fn hex_bytes(data: &[u8]) -> String {

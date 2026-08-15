@@ -1,13 +1,14 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::hidpp::device::Device;
+use crate::lighting::rgb::{Effect, EffectOptions, encode_effect, raw_effect_name};
 
 const FEATURE_ONBOARD_PROFILES: u16 = 0x8100;
 const BUTTONS_OFFSET: usize = 32;
@@ -15,10 +16,15 @@ const GSHIFT_BUTTONS_OFFSET: usize = 96;
 const BUTTON_COUNT: usize = 16;
 const PROFILE_NAME_OFFSET: usize = 0xA0;
 const PROFILE_NAME_UNITS: usize = 24;
+const LED_SLOTS_OFFSET: usize = 0xD0;
+const LED_SLOT_SIZE: usize = 11;
+const LED_SLOT_COUNT: usize = 4;
 const MIN_PROFILE_SECTOR_SIZE: usize = GSHIFT_BUTTONS_OFFSET + BUTTON_COUNT * 4 + 2;
 const DUMP_MAGIC: &[u8; 8] = b"BLHOB001";
+const EXPORT_VERSION: u32 = 1;
+type PackedMacros = (Vec<(u16, Vec<u8>)>, Vec<(u16, u16)>);
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Description {
     pub raw: [u8; 16],
     pub memory_model_id: u8,
@@ -93,7 +99,7 @@ impl Description {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DirectoryEntry {
     pub index: usize,
     pub sector: u16,
@@ -104,6 +110,7 @@ pub struct DirectoryEntry {
 pub enum Binding {
     Mouse(u8),
     Key { modifiers: u8, usage: u8 },
+    Consumer(u16),
     Macro { sector: u16, offset: u16 },
     Special(u8),
     Disabled,
@@ -120,6 +127,10 @@ impl Binding {
                 Ok([0x80, 0x01, high, low])
             }
             Self::Key { modifiers, usage } => Ok([0x80, 0x02, *modifiers, *usage]),
+            Self::Consumer(usage) => {
+                let [high, low] = usage.to_be_bytes();
+                Ok([0x80, 0x03, high, low])
+            }
             Self::Macro { sector, offset } => {
                 let [sector_high, sector_low] = sector.to_be_bytes();
                 let [offset_high, offset_low] = offset.to_be_bytes();
@@ -146,6 +157,7 @@ impl Binding {
                 modifiers: raw[2],
                 usage: raw[3],
             },
+            (0x80, 0x03) => Self::Consumer(u16::from_be_bytes([raw[2], raw[3]])),
             (0x00, _) => Self::Macro {
                 sector: u16::from_be_bytes([raw[0], raw[1]]),
                 offset: u16::from_be_bytes([raw[2], raw[3]]),
@@ -164,6 +176,7 @@ impl fmt::Display for Binding {
             Self::Key { modifiers, usage } => {
                 write!(f, "key:{}", format_key_combo(*modifiers, *usage))
             }
+            Self::Consumer(usage) => write!(f, "key:{}", consumer_name(*usage)),
             Self::Macro { sector, offset } => {
                 write!(f, "macro:0x{sector:04X}:0x{offset:04X}")
             }
@@ -186,6 +199,22 @@ pub struct ButtonRow {
     pub raw: String,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum VerificationMethod {
+    GetCrc,
+    ReadBack,
+}
+
+impl fmt::Display for VerificationMethod {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::GetCrc => "GetCRC",
+            Self::ReadBack => "read-back",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct CrcResponse {
     pub raw: [u8; 16],
@@ -196,6 +225,95 @@ pub struct CrcResponse {
 pub struct SectorDump {
     pub description: Description,
     pub sectors: Vec<(u16, Vec<u8>)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Macro {
+    pub steps: Vec<MacroStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum MacroStep {
+    KeyPress { key_press: String },
+    KeyRelease { key_release: String },
+    Key { key: String },
+    Delay { delay_ms: u16 },
+    Consumer { consumer: String },
+    Text { text: String },
+    WaitForRelease { wait_for_release: bool },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LedSlot {
+    pub slot: usize,
+    pub effect: String,
+    pub raw_id: u8,
+    pub parameters_hex: String,
+    pub raw_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DpiTable {
+    pub levels: Vec<u16>,
+    pub default_index: u8,
+    pub shift_index: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportBinding {
+    pub number: usize,
+    pub control: String,
+    pub binding: String,
+    pub raw_hex: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub r#macro: Option<Macro>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportProfile {
+    pub index: usize,
+    pub sector: u16,
+    pub enabled: bool,
+    pub name: Option<String>,
+    pub rate_hz: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dpi: Option<DpiTable>,
+    pub bindings: Vec<ExportBinding>,
+    pub gshift_bindings: Vec<ExportBinding>,
+    pub led_slots: Vec<LedSlot>,
+    pub raw_sector_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ExportDirectory {
+    pub entries: Vec<DirectoryEntry>,
+    pub raw_sector_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RawSector {
+    pub sector: u16,
+    pub raw_hex: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OnboardExport {
+    pub version: u32,
+    pub device_type: String,
+    pub description: Description,
+    pub directory: ExportDirectory,
+    pub profiles: Vec<ExportProfile>,
+    pub macro_sectors: Vec<RawSector>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SectorDiff {
+    pub sector: u16,
+    pub current_crc: u16,
+    pub replacement_crc: u16,
+    pub current: Vec<u8>,
+    pub replacement: Vec<u8>,
 }
 
 pub struct Onboard<'a> {
@@ -319,7 +437,7 @@ impl<'a> Onboard<'a> {
         expected_original: &[u8],
         replacement: &[u8],
         allow_directory: bool,
-    ) -> Result<()> {
+    ) -> Result<VerificationMethod> {
         ensure!(
             sector != 0 || allow_directory,
             "sector 0 may only be written by restore"
@@ -360,6 +478,17 @@ impl<'a> Onboard<'a> {
             .call_short(self.feature, 8, &[])
             .map_err(anyhow::Error::new)?;
 
+        let expected_crc = u16::from_be_bytes([
+            replacement[replacement.len() - 2],
+            replacement[replacement.len() - 1],
+        ]);
+        if self
+            .get_crc(sector)
+            .is_ok_and(|response| crc_response_is_unambiguous(&response, expected_crc))
+        {
+            return Ok(VerificationMethod::GetCrc);
+        }
+
         let verified = self.read_sector(sector, size)?;
         ensure!(
             verified == replacement,
@@ -369,7 +498,7 @@ impl<'a> Onboard<'a> {
             sector_crc_valid(&verified),
             "sector read-back CRC is invalid"
         );
-        Ok(())
+        Ok(VerificationMethod::ReadBack)
     }
 
     pub fn directory(&self, description: &Description) -> Result<(Vec<u8>, Vec<DirectoryEntry>)> {
@@ -380,19 +509,15 @@ impl<'a> Onboard<'a> {
 
     pub fn dump(&self) -> Result<SectorDump> {
         let description = self.description()?;
-        let (directory, entries) = self.directory(&description)?;
+        let (directory, _) = self.directory(&description)?;
         let mut sectors = vec![(0, directory)];
-        let mut seen = BTreeSet::from([0_u16]);
-        for entry in entries {
-            if seen.insert(entry.sector) {
-                let data = self.read_sector(entry.sector, description.sector_size)?;
-                ensure!(
-                    sector_crc_valid(&data),
-                    "sector 0x{:04X} has an invalid CRC",
-                    entry.sector
-                );
-                sectors.push((entry.sector, data));
-            }
+        for sector in 1..u16::from(description.sector_count) {
+            let data = self.read_sector(sector, description.sector_size)?;
+            ensure!(
+                sector_crc_valid(&data),
+                "sector 0x{sector:04X} has an invalid CRC"
+            );
+            sectors.push((sector, data));
         }
         Ok(SectorDump {
             description,
@@ -449,6 +574,12 @@ fn parse_crc_response(raw: [u8; 16]) -> CrcResponse {
     }
 }
 
+fn crc_response_is_unambiguous(response: &CrcResponse, expected: u16) -> bool {
+    response.crc == expected
+        && (response.raw[2..].iter().all(|byte| *byte == 0)
+            || response.raw[2..].iter().all(|byte| *byte == 0xFF))
+}
+
 fn crc_request(sector: u16) -> [u8; 2] {
     sector.to_be_bytes()
 }
@@ -468,15 +599,20 @@ pub fn first_enabled_sector(entries: &[DirectoryEntry]) -> Result<u16> {
         .context("profile directory has no enabled profile")
 }
 
-pub fn button_rows(sector: &[u8]) -> Result<Vec<ButtonRow>> {
+pub fn button_rows(sector: &[u8], button_count: u8, keyboard: bool) -> Result<Vec<ButtonRow>> {
     validate_profile_sector(sector)?;
-    let mut rows = Vec::with_capacity(32);
+    let count = BUTTON_COUNT.min(usize::from(button_count));
+    let mut rows = Vec::with_capacity(count * 2);
     for (gshift, base) in [(false, BUTTONS_OFFSET), (true, GSHIFT_BUTTONS_OFFSET)] {
-        for index in 0..BUTTON_COUNT {
+        for index in 0..count {
             let offset = base + index * 4;
             let raw: [u8; 4] = sector[offset..offset + 4].try_into().unwrap();
             rows.push(ButtonRow {
-                button: format!("G{}", index + 1),
+                button: if keyboard {
+                    format!("g{}", index + 1)
+                } else {
+                    format!("button {}", index + 1)
+                },
                 gshift,
                 binding: Binding::decode(raw).to_string(),
                 raw: raw.iter().map(|byte| format!("{byte:02X}")).collect(),
@@ -600,6 +736,108 @@ pub fn set_profile_name(sector: &mut [u8], name: &str) -> Result<()> {
     update_sector_crc(sector)
 }
 
+pub fn set_profile_name_optional(sector: &mut [u8], name: Option<&str>) -> Result<()> {
+    if let Some(name) = name {
+        return set_profile_name(sector, name);
+    }
+    validate_profile_sector(sector)?;
+    ensure!(
+        sector.len() >= PROFILE_NAME_OFFSET + PROFILE_NAME_UNITS * 2 + 2,
+        "profile sector is too short for a layout-A name"
+    );
+    sector[PROFILE_NAME_OFFSET..PROFILE_NAME_OFFSET + PROFILE_NAME_UNITS * 2].fill(0xFF);
+    update_sector_crc(sector)
+}
+
+pub fn report_rate(sector: &[u8]) -> Result<Option<u32>> {
+    validate_profile_sector(sector)?;
+    let interval = sector[0];
+    Ok((interval != 0 && 1000 % u32::from(interval) == 0).then_some(1000 / u32::from(interval)))
+}
+
+pub fn dpi_table(sector: &[u8]) -> Result<DpiTable> {
+    validate_profile_sector(sector)?;
+    let levels = (0..5)
+        .map(|index| u16::from_le_bytes([sector[3 + index * 2], sector[4 + index * 2]]))
+        .take_while(|level| *level != 0)
+        .collect::<Vec<_>>();
+    ensure!(!levels.is_empty(), "profile DPI table has no levels");
+    ensure!(
+        usize::from(sector[1]) < levels.len(),
+        "default DPI index is outside the profile table"
+    );
+    let shift_index = (sector[2] != 0xFF).then_some(sector[2]);
+    if let Some(index) = shift_index {
+        ensure!(
+            usize::from(index) < levels.len(),
+            "shift DPI index is outside the profile table"
+        );
+    }
+    Ok(DpiTable {
+        levels,
+        default_index: sector[1],
+        shift_index,
+    })
+}
+
+pub fn set_dpi_table(sector: &mut [u8], table: &DpiTable) -> Result<()> {
+    let shift = table
+        .shift_index
+        .map(|index| {
+            table
+                .levels
+                .get(usize::from(index))
+                .copied()
+                .context("shift DPI index is outside the imported table")
+        })
+        .transpose()?;
+    set_dpi(
+        sector,
+        &table.levels,
+        usize::from(table.default_index),
+        shift,
+    )
+}
+
+pub fn led_slots(sector: &[u8]) -> Result<Vec<LedSlot>> {
+    validate_profile_sector(sector)?;
+    ensure!(
+        sector.len() >= LED_SLOTS_OFFSET + LED_SLOT_COUNT * LED_SLOT_SIZE + 2,
+        "profile sector is too short for layout-A LED slots"
+    );
+    Ok((0..LED_SLOT_COUNT)
+        .map(|slot| {
+            let offset = LED_SLOTS_OFFSET + slot * LED_SLOT_SIZE;
+            let raw = &sector[offset..offset + LED_SLOT_SIZE];
+            LedSlot {
+                slot,
+                effect: raw_effect_name(u16::from(raw[0])).to_owned(),
+                raw_id: raw[0],
+                parameters_hex: encode_hex(&raw[1..]),
+                raw_hex: encode_hex(raw),
+            }
+        })
+        .collect())
+}
+
+pub fn set_led_slot(
+    sector: &mut [u8],
+    slot: usize,
+    effect: Effect,
+    options: &EffectOptions,
+) -> Result<()> {
+    validate_profile_sector(sector)?;
+    ensure!(slot < LED_SLOT_COUNT, "LED slot must be 0..=3");
+    ensure!(
+        sector.len() >= LED_SLOTS_OFFSET + LED_SLOT_COUNT * LED_SLOT_SIZE + 2,
+        "profile sector is too short for layout-A LED slots"
+    );
+    let offset = LED_SLOTS_OFFSET + slot * LED_SLOT_SIZE;
+    sector[offset] = u8::try_from(effect.raw_id).context("RGB effect id does not fit one byte")?;
+    sector[offset + 1..offset + LED_SLOT_SIZE].copy_from_slice(&encode_effect(effect, options)?);
+    update_sector_crc(sector)
+}
+
 fn validate_profile_sector(sector: &[u8]) -> Result<()> {
     ensure!(
         sector.len() >= MIN_PROFILE_SECTOR_SIZE,
@@ -653,7 +891,7 @@ pub fn update_sector_crc(data: &mut [u8]) -> Result<()> {
 }
 
 pub fn parse_binding(value: &str) -> Result<Binding> {
-    let lower = value.to_ascii_lowercase();
+    let lower = value.trim().to_ascii_lowercase();
     if lower == "disabled" {
         return Ok(Binding::Disabled);
     }
@@ -669,8 +907,12 @@ pub fn parse_binding(value: &str) -> Result<Binding> {
         return Ok(Binding::Mouse(button));
     }
     if let Some(combo) = lower.strip_prefix("key:") {
-        let (modifiers, usage) = parse_key_combo(combo)?;
-        return Ok(Binding::Key { modifiers, usage });
+        return parse_keystroke(combo);
+    }
+    if let Some(name) = lower.strip_prefix("consumer:") {
+        return Ok(Binding::Consumer(
+            consumer_usage(name).with_context(|| format!("unknown consumer key {name:?}"))?,
+        ));
     }
     if let Some(value) = lower.strip_prefix("macro:") {
         let (sector, offset) = value
@@ -680,6 +922,11 @@ pub fn parse_binding(value: &str) -> Result<Binding> {
             sector: parse_u16(sector)?,
             offset: parse_u16(offset)?,
         });
+    }
+    if let Some(raw) = lower.strip_prefix("raw:") {
+        let bytes = decode_hex(raw)?;
+        ensure!(bytes.len() == 4, "raw binding must contain exactly 4 bytes");
+        return Ok(Binding::Other(bytes.try_into().unwrap()));
     }
     let special = match lower.as_str() {
         "noop" => 0x00,
@@ -704,6 +951,17 @@ pub fn parse_binding(value: &str) -> Result<Binding> {
     Ok(Binding::Special(special))
 }
 
+fn parse_keystroke(combo: &str) -> Result<Binding> {
+    let normalized = normalize_key_name(combo);
+    if !combo.contains('+')
+        && let Some(usage) = consumer_usage(&normalized)
+    {
+        return Ok(Binding::Consumer(usage));
+    }
+    let (modifiers, usage) = parse_key_combo(combo)?;
+    Ok(Binding::Key { modifiers, usage })
+}
+
 fn parse_u16(value: &str) -> Result<u16> {
     let result = if let Some(hex) = value.strip_prefix("0x") {
         u16::from_str_radix(hex, 16)
@@ -717,13 +975,18 @@ pub fn parse_key_combo(combo: &str) -> Result<(u8, u8)> {
     let mut modifiers = 0_u8;
     let mut usage = None;
     for part in combo.split('+') {
+        let part = part.trim();
         ensure!(!part.is_empty(), "empty key-combo component");
-        let lower = part.to_ascii_lowercase();
+        let lower = normalize_key_name(part);
         let modifier = match lower.as_str() {
             "ctrl" | "control" => Some(0x01),
             "shift" => Some(0x02),
             "alt" => Some(0x04),
             "win" | "meta" | "super" => Some(0x08),
+            "rctrl" | "rightctrl" | "rightcontrol" => Some(0x10),
+            "rshift" | "rightshift" => Some(0x20),
+            "ralt" | "rightalt" | "altgr" => Some(0x40),
+            "rwin" | "rightwin" | "rightmeta" | "rightgui" => Some(0x80),
             _ => None,
         };
         if let Some(modifier) = modifier {
@@ -737,13 +1000,21 @@ pub fn parse_key_combo(combo: &str) -> Result<(u8, u8)> {
             usage = Some(key_usage(&lower).with_context(|| format!("unknown key {part:?}"))?);
         }
     }
-    Ok((
-        modifiers,
-        usage.context("key combo has no non-modifier key")?,
-    ))
+    ensure!(modifiers != 0 || usage.is_some(), "key combo is empty");
+    Ok((modifiers, usage.unwrap_or(0)))
+}
+
+fn normalize_key_name(value: &str) -> String {
+    value
+        .trim()
+        .to_ascii_lowercase()
+        .replace(['-', '_', ' '], "")
 }
 
 fn key_usage(key: &str) -> Option<u8> {
+    if let Some(hex) = key.strip_prefix("usage0x") {
+        return u8::from_str_radix(hex, 16).ok();
+    }
     if key.len() == 1 {
         let byte = key.as_bytes()[0];
         return match byte {
@@ -798,15 +1069,59 @@ fn key_usage(key: &str) -> Option<u8> {
     })
 }
 
+fn consumer_usage(value: &str) -> Option<u16> {
+    let name = normalize_key_name(value);
+    if let Some(hex) = name
+        .strip_prefix("consumer0x")
+        .or_else(|| name.strip_prefix("0x"))
+    {
+        return u16::from_str_radix(hex, 16).ok();
+    }
+    Some(match name.as_str() {
+        "playpause" | "mediaplaypause" => 0x00CD,
+        "stop" | "mediastop" => 0x00B7,
+        "volumeup" => 0x00E9,
+        "volumedown" => 0x00EA,
+        "next" | "nexttrack" | "medianext" => 0x00B5,
+        "previous" | "previoustrack" | "prevtrack" | "mediaprev" | "mediaprevious" => 0x00B6,
+        "mute" | "volumemute" | "mediamute" => 0x00E2,
+        _ => return None,
+    })
+}
+
 fn format_key_combo(modifiers: u8, usage: u8) -> String {
     let mut parts = Vec::new();
-    for (mask, name) in [(1, "ctrl"), (2, "shift"), (4, "alt"), (8, "win")] {
+    for (mask, name) in [
+        (1, "ctrl"),
+        (2, "shift"),
+        (4, "alt"),
+        (8, "win"),
+        (0x10, "rctrl"),
+        (0x20, "rshift"),
+        (0x40, "ralt"),
+        (0x80, "rwin"),
+    ] {
         if modifiers & mask != 0 {
             parts.push(name.to_owned());
         }
     }
-    parts.push(usage_name(usage));
+    if usage != 0 {
+        parts.push(usage_name(usage));
+    }
     parts.join("+")
+}
+
+fn consumer_name(usage: u16) -> String {
+    match usage {
+        0x00CD => "play-pause".into(),
+        0x00B7 => "media-stop".into(),
+        0x00E9 => "volume-up".into(),
+        0x00EA => "volume-down".into(),
+        0x00B5 => "next-track".into(),
+        0x00B6 => "previous-track".into(),
+        0x00E2 => "mute".into(),
+        _ => format!("consumer-0x{usage:04X}"),
+    }
 }
 
 fn usage_name(usage: u8) -> String {
@@ -869,6 +1184,922 @@ fn special_name(code: u8) -> String {
     }
 }
 
+impl Macro {
+    pub fn from_steps_json(value: &str) -> Result<Self> {
+        let steps = serde_json::from_str(value).context("--steps must be a JSON array")?;
+        let result = Self { steps };
+        encode_macro(&result)?;
+        Ok(result)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        for step in &self.steps {
+            match step {
+                MacroStep::KeyPress { key_press } => {
+                    parse_key_combo(key_press)?;
+                }
+                MacroStep::KeyRelease { key_release } => {
+                    parse_key_combo(key_release)?;
+                }
+                MacroStep::Key { key } => {
+                    parse_key_combo(key)?;
+                }
+                MacroStep::Delay { .. } => {}
+                MacroStep::Consumer { consumer } => {
+                    consumer_usage(consumer)
+                        .with_context(|| format!("unknown consumer key {consumer:?}"))?;
+                }
+                MacroStep::Text { text } => {
+                    for character in text.chars() {
+                        ascii_key(character)
+                            .with_context(|| format!("onboard text contains non-ASCII or unsupported character {character:?}"))?;
+                    }
+                }
+                MacroStep::WaitForRelease { wait_for_release } => ensure!(
+                    *wait_for_release,
+                    "wait_for_release must be true when present"
+                ),
+            }
+        }
+        Ok(())
+    }
+}
+
+fn macro_events(value: &Macro) -> Result<Vec<Vec<u8>>> {
+    value.validate()?;
+    let mut events = Vec::new();
+    for step in &value.steps {
+        match step {
+            MacroStep::KeyPress { key_press } => {
+                let (modifiers, usage) = parse_key_combo(key_press)?;
+                events.push(vec![0x43, modifiers, usage]);
+            }
+            MacroStep::KeyRelease { key_release } => {
+                let (modifiers, usage) = parse_key_combo(key_release)?;
+                events.push(vec![0x44, modifiers, usage]);
+            }
+            MacroStep::Key { key } => {
+                let (modifiers, usage) = parse_key_combo(key)?;
+                events.push(vec![0x43, modifiers, usage]);
+                events.push(vec![0x44, modifiers, usage]);
+            }
+            MacroStep::Delay { delay_ms } => {
+                let [high, low] = delay_ms.to_be_bytes();
+                events.push(vec![0x40, high, low]);
+            }
+            MacroStep::Consumer { consumer } => {
+                let usage = consumer_usage(consumer)
+                    .with_context(|| format!("unknown consumer key {consumer:?}"))?;
+                let [high, low] = usage.to_be_bytes();
+                events.push(vec![0x45, high, low]);
+                events.push(vec![0x46, high, low]);
+            }
+            MacroStep::Text { text } => {
+                for character in text.chars() {
+                    let (modifiers, usage) = ascii_key(character).unwrap();
+                    events.push(vec![0x43, modifiers, usage]);
+                    events.push(vec![0x44, modifiers, usage]);
+                }
+            }
+            MacroStep::WaitForRelease { .. } => events.push(vec![0x01]),
+        }
+    }
+    Ok(events)
+}
+
+pub fn encode_macro(value: &Macro) -> Result<Vec<u8>> {
+    let mut bytes = macro_events(value)?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    bytes.push(0xFF);
+    if bytes.len() % 2 != 0 {
+        bytes.push(0xFF);
+    }
+    Ok(bytes)
+}
+
+fn ascii_key(character: char) -> Option<(u8, u8)> {
+    if character.is_ascii_lowercase() {
+        return Some((0, 0x04 + character as u8 - b'a'));
+    }
+    if character.is_ascii_uppercase() {
+        return Some((0x02, 0x04 + character as u8 - b'A'));
+    }
+    if character.is_ascii_digit() {
+        return key_usage(&character.to_string()).map(|usage| (0, usage));
+    }
+    Some(match character {
+        ' ' => (0, 0x2C),
+        '\n' | '\r' => (0, 0x28),
+        '\t' => (0, 0x2B),
+        '-' => (0, 0x2D),
+        '_' => (0x02, 0x2D),
+        '=' => (0, 0x2E),
+        '+' => (0x02, 0x2E),
+        '[' => (0, 0x2F),
+        '{' => (0x02, 0x2F),
+        ']' => (0, 0x30),
+        '}' => (0x02, 0x30),
+        '\\' => (0, 0x31),
+        '|' => (0x02, 0x31),
+        ';' => (0, 0x33),
+        ':' => (0x02, 0x33),
+        '\'' => (0, 0x34),
+        '"' => (0x02, 0x34),
+        '`' => (0, 0x35),
+        '~' => (0x02, 0x35),
+        ',' => (0, 0x36),
+        '<' => (0x02, 0x36),
+        '.' => (0, 0x37),
+        '>' => (0x02, 0x37),
+        '/' => (0, 0x38),
+        '?' => (0x02, 0x38),
+        '!' => (0x02, 0x1E),
+        '@' => (0x02, 0x1F),
+        '#' => (0x02, 0x20),
+        '$' => (0x02, 0x21),
+        '%' => (0x02, 0x22),
+        '^' => (0x02, 0x23),
+        '&' => (0x02, 0x24),
+        '*' => (0x02, 0x25),
+        '(' => (0x02, 0x26),
+        ')' => (0x02, 0x27),
+        _ => return None,
+    })
+}
+
+pub fn macro_sector_ids(description: &Description, entries: &[DirectoryEntry]) -> Result<Vec<u16>> {
+    let last_profile = entries.iter().map(|entry| entry.sector).max().unwrap_or(0);
+    ensure!(
+        last_profile < u16::from(description.sector_count),
+        "profile sector 0x{last_profile:04X} is outside sector_count {}",
+        description.sector_count
+    );
+    let profile_sectors = entries
+        .iter()
+        .map(|entry| entry.sector)
+        .collect::<BTreeSet<_>>();
+    let sectors = (last_profile + 1..u16::from(description.sector_count))
+        .filter(|sector| *sector != 0 && !profile_sectors.contains(sector))
+        .collect::<Vec<_>>();
+    ensure!(
+        !sectors.is_empty(),
+        "device description has no macro sectors"
+    );
+    Ok(sectors)
+}
+
+pub fn pack_macros(
+    macros: &[Macro],
+    macro_sectors: &[u16],
+    sector_size: u16,
+) -> Result<PackedMacros> {
+    ensure!(!macro_sectors.is_empty(), "no macro sectors are available");
+    let size = usize::from(sector_size);
+    ensure!(size >= 8, "macro sector is too small");
+    let payload_size = size - 2;
+    let mut sectors = macro_sectors
+        .iter()
+        .map(|sector| (*sector, vec![0xFF; size]))
+        .collect::<Vec<_>>();
+    let mut sector_index = 0_usize;
+    let mut offset = 0_usize;
+    let mut locations = Vec::with_capacity(macros.len());
+
+    for (macro_index, value) in macros.iter().enumerate() {
+        ensure!(offset & 1 == 0, "macro packer lost 2-byte record alignment");
+        locations.push((
+            sectors[sector_index].0,
+            u16::try_from(offset).context("macro offset is too large")?,
+        ));
+        let events = macro_events(value)?;
+        for (index, event) in events.iter().enumerate() {
+            let next_len = events.get(index + 1).map_or(2, Vec::len);
+            place_macro_event(
+                &mut sectors,
+                macro_sectors,
+                payload_size,
+                &mut sector_index,
+                &mut offset,
+                event,
+                Some(next_len),
+            )?;
+        }
+        place_macro_end(
+            &mut sectors,
+            macro_sectors,
+            payload_size,
+            &mut sector_index,
+            &mut offset,
+            macro_index + 1 < macros.len(),
+        )?;
+    }
+    for (_, sector) in &mut sectors {
+        update_sector_crc(sector)?;
+    }
+    Ok((sectors, locations))
+}
+
+fn place_macro_event(
+    sectors: &mut [(u16, Vec<u8>)],
+    ids: &[u16],
+    payload_size: usize,
+    sector_index: &mut usize,
+    offset: &mut usize,
+    event: &[u8],
+    next_len: Option<usize>,
+) -> Result<()> {
+    ensure!(
+        event.len() <= payload_size,
+        "macro event is larger than a sector"
+    );
+    let remaining = payload_size - *offset;
+    let after = remaining.saturating_sub(event.len());
+    let must_jump =
+        event.len() > remaining || (next_len.is_some() && event.len() <= remaining && after < 5);
+    if must_jump {
+        append_macro_jump(sectors, ids, payload_size, sector_index, offset)?;
+    }
+    ensure!(
+        event.len() <= payload_size - *offset,
+        "macro event does not fit after sector jump"
+    );
+    sectors[*sector_index].1[*offset..*offset + event.len()].copy_from_slice(event);
+    *offset += event.len();
+    Ok(())
+}
+
+fn append_macro_jump(
+    sectors: &mut [(u16, Vec<u8>)],
+    ids: &[u16],
+    payload_size: usize,
+    sector_index: &mut usize,
+    offset: &mut usize,
+) -> Result<()> {
+    ensure!(
+        payload_size - *offset >= 5,
+        "insufficient space for JUMP event in macro sector 0x{:04X}",
+        ids[*sector_index]
+    );
+    ensure!(
+        *sector_index + 1 < ids.len(),
+        "macro data exceeds available macro sectors"
+    );
+    let next = ids[*sector_index + 1].to_be_bytes();
+    sectors[*sector_index].1[*offset..*offset + 5].copy_from_slice(&[0x60, next[0], next[1], 0, 0]);
+    *sector_index += 1;
+    *offset = 0;
+    Ok(())
+}
+
+fn place_macro_end(
+    sectors: &mut [(u16, Vec<u8>)],
+    ids: &[u16],
+    payload_size: usize,
+    sector_index: &mut usize,
+    offset: &mut usize,
+    has_next_macro: bool,
+) -> Result<()> {
+    let needed = if (*offset + 1) % 2 == 1 { 2 } else { 1 };
+    let remaining = payload_size - *offset;
+    if remaining < needed || (has_next_macro && remaining - needed < 5) {
+        append_macro_jump(sectors, ids, payload_size, sector_index, offset)?;
+    }
+    sectors[*sector_index].1[*offset] = 0xFF;
+    *offset += 1;
+    if *offset % 2 == 1 {
+        sectors[*sector_index].1[*offset] = 0xFF;
+        *offset += 1;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecodedMacroEvent {
+    KeyPress(u8, u8),
+    KeyRelease(u8, u8),
+    Delay(u16),
+    ConsumerDown(u16),
+    ConsumerUp(u16),
+    WaitForRelease,
+}
+
+pub fn decode_macro(
+    sectors: &BTreeMap<u16, Vec<u8>>,
+    macro_sector_ids: &BTreeSet<u16>,
+    start_sector: u16,
+    start_offset: u16,
+) -> Result<Macro> {
+    ensure!(
+        macro_sector_ids.contains(&start_sector),
+        "macro starts outside the explicit macro-sector range"
+    );
+    let mut sector = start_sector;
+    let mut offset = usize::from(start_offset);
+    let mut visited = BTreeSet::new();
+    let mut events = Vec::new();
+
+    loop {
+        ensure!(
+            visited.insert((sector, offset)),
+            "macro bytecode contains a loop"
+        );
+        let data = sectors
+            .get(&sector)
+            .with_context(|| format!("macro sector 0x{sector:04X} was not read"))?;
+        ensure!(
+            sector_crc_valid(data),
+            "macro sector 0x{sector:04X} CRC is invalid"
+        );
+        let payload_end = data.len() - 2;
+        ensure!(
+            offset < payload_end,
+            "macro offset is outside sector payload"
+        );
+        let opcode = data[offset];
+        match opcode {
+            0x01 => {
+                events.push(DecodedMacroEvent::WaitForRelease);
+                offset += 1;
+            }
+            0x40 | 0x43..=0x46 => {
+                ensure!(
+                    offset + 3 <= payload_end,
+                    "truncated macro event 0x{opcode:02X}"
+                );
+                let first = data[offset + 1];
+                let second = data[offset + 2];
+                events.push(match opcode {
+                    0x40 => DecodedMacroEvent::Delay(u16::from_be_bytes([first, second])),
+                    0x43 => DecodedMacroEvent::KeyPress(first, second),
+                    0x44 => DecodedMacroEvent::KeyRelease(first, second),
+                    0x45 => DecodedMacroEvent::ConsumerDown(u16::from_be_bytes([first, second])),
+                    0x46 => DecodedMacroEvent::ConsumerUp(u16::from_be_bytes([first, second])),
+                    _ => unreachable!(),
+                });
+                offset += 3;
+            }
+            0x60 => {
+                ensure!(offset + 5 <= payload_end, "truncated macro JUMP event");
+                ensure!(
+                    data[offset + 3..offset + 5] == [0, 0],
+                    "macro JUMP padding is not 0x0000"
+                );
+                let next = u16::from_be_bytes([data[offset + 1], data[offset + 2]]);
+                ensure!(
+                    macro_sector_ids.contains(&next),
+                    "macro JUMP targets non-macro sector 0x{next:04X}"
+                );
+                sector = next;
+                offset = 0;
+            }
+            0xFF => break,
+            _ => bail!("unsupported onboard macro opcode 0x{opcode:02X}"),
+        }
+        ensure!(events.len() <= 65_535, "macro contains too many events");
+    }
+    Ok(Macro {
+        steps: collapse_macro_events(&events)?,
+    })
+}
+
+fn collapse_macro_events(events: &[DecodedMacroEvent]) -> Result<Vec<MacroStep>> {
+    let mut steps = Vec::new();
+    let mut index = 0;
+    while index < events.len() {
+        match events[index] {
+            DecodedMacroEvent::KeyPress(modifiers, usage)
+                if events.get(index + 1)
+                    == Some(&DecodedMacroEvent::KeyRelease(modifiers, usage)) =>
+            {
+                steps.push(MacroStep::Key {
+                    key: format_key_combo(modifiers, usage),
+                });
+                index += 1;
+            }
+            DecodedMacroEvent::KeyPress(modifiers, usage) => steps.push(MacroStep::KeyPress {
+                key_press: format_key_combo(modifiers, usage),
+            }),
+            DecodedMacroEvent::KeyRelease(modifiers, usage) => steps.push(MacroStep::KeyRelease {
+                key_release: format_key_combo(modifiers, usage),
+            }),
+            DecodedMacroEvent::Delay(delay_ms) => steps.push(MacroStep::Delay { delay_ms }),
+            DecodedMacroEvent::ConsumerDown(usage)
+                if events.get(index + 1) == Some(&DecodedMacroEvent::ConsumerUp(usage)) =>
+            {
+                steps.push(MacroStep::Consumer {
+                    consumer: consumer_name(usage),
+                });
+                index += 1;
+            }
+            DecodedMacroEvent::ConsumerDown(usage) => {
+                bail!("consumer-down 0x{usage:04X} is not followed by matching consumer-up")
+            }
+            DecodedMacroEvent::ConsumerUp(usage) => {
+                bail!("consumer-up 0x{usage:04X} has no matching consumer-down")
+            }
+            DecodedMacroEvent::WaitForRelease => steps.push(MacroStep::WaitForRelease {
+                wait_for_release: true,
+            }),
+        }
+        index += 1;
+    }
+    Ok(steps)
+}
+
+fn encode_hex(data: &[u8]) -> String {
+    data.iter().map(|byte| format!("{byte:02X}")).collect()
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>> {
+    let compact = value
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    ensure!(
+        compact.len() % 2 == 0,
+        "hex string has an odd number of digits"
+    );
+    compact
+        .chunks_exact(2)
+        .map(|pair| {
+            let text = std::str::from_utf8(pair).unwrap();
+            u8::from_str_radix(text, 16).with_context(|| format!("invalid hex byte {text:?}"))
+        })
+        .collect()
+}
+
+pub fn export_state(dump: &SectorDump, device_type: &str) -> Result<OnboardExport> {
+    let parsed_description = Description::parse(dump.description.raw)?;
+    ensure!(
+        parsed_description == dump.description,
+        "description fields do not match description.raw"
+    );
+    let sectors = sector_map(dump)?;
+    let directory_raw = sectors
+        .get(&0)
+        .context("onboard sector set has no directory sector 0")?;
+    let entries = parse_directory(directory_raw, dump.description.profile_count)?;
+    let macro_ids = macro_sector_ids(&dump.description, &entries)?;
+    let macro_id_set = macro_ids.iter().copied().collect::<BTreeSet<_>>();
+    let keyboard = device_type.eq_ignore_ascii_case("KEYBOARD");
+    let count = BUTTON_COUNT.min(usize::from(dump.description.button_count));
+    let mut profiles = Vec::with_capacity(entries.len());
+
+    for entry in &entries {
+        let sector = sectors
+            .get(&entry.sector)
+            .with_context(|| format!("profile sector 0x{:04X} was not read", entry.sector))?;
+        validate_profile_sector(sector)?;
+        let bindings = export_binding_bank(
+            sector,
+            BUTTONS_OFFSET,
+            count,
+            keyboard,
+            &sectors,
+            &macro_id_set,
+        )?;
+        let gshift_bindings = export_binding_bank(
+            sector,
+            GSHIFT_BUTTONS_OFFSET,
+            count,
+            keyboard,
+            &sectors,
+            &macro_id_set,
+        )?;
+        profiles.push(ExportProfile {
+            index: entry.index,
+            sector: entry.sector,
+            enabled: entry.enabled,
+            name: profile_name(sector)?,
+            rate_hz: report_rate(sector)?,
+            dpi: if keyboard {
+                None
+            } else {
+                match dpi_table(sector) {
+                    Ok(table) => Some(table),
+                    Err(_) if !entry.enabled => None,
+                    Err(error) => return Err(error),
+                }
+            },
+            bindings,
+            gshift_bindings,
+            led_slots: led_slots(sector)?,
+            raw_sector_hex: encode_hex(sector),
+        });
+    }
+
+    Ok(OnboardExport {
+        version: EXPORT_VERSION,
+        device_type: device_type.to_ascii_uppercase(),
+        description: dump.description.clone(),
+        directory: ExportDirectory {
+            entries,
+            raw_sector_hex: encode_hex(directory_raw),
+        },
+        profiles,
+        macro_sectors: macro_ids
+            .into_iter()
+            .map(|sector| {
+                Ok(RawSector {
+                    sector,
+                    raw_hex: encode_hex(
+                        sectors
+                            .get(&sector)
+                            .with_context(|| format!("macro sector 0x{sector:04X} was not read"))?,
+                    ),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+    })
+}
+
+fn export_binding_bank(
+    sector: &[u8],
+    base: usize,
+    count: usize,
+    keyboard: bool,
+    sectors: &BTreeMap<u16, Vec<u8>>,
+    macro_ids: &BTreeSet<u16>,
+) -> Result<Vec<ExportBinding>> {
+    (0..count)
+        .map(|index| {
+            let offset = base + index * 4;
+            let raw: [u8; 4] = sector[offset..offset + 4].try_into().unwrap();
+            let binding = Binding::decode(raw);
+            let r#macro = match binding {
+                Binding::Macro { sector, offset } => {
+                    Some(decode_macro(sectors, macro_ids, sector, offset)?)
+                }
+                _ => None,
+            };
+            Ok(ExportBinding {
+                number: index + 1,
+                control: if keyboard {
+                    format!("g{}", index + 1)
+                } else {
+                    format!("button {}", index + 1)
+                },
+                binding: binding.to_string(),
+                raw_hex: encode_hex(&raw),
+                r#macro,
+            })
+        })
+        .collect()
+}
+
+pub fn save_export(path: &Path, export: &OnboardExport) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("failed to create {}", parent.display()))?;
+    }
+    let mut bytes =
+        serde_json::to_vec_pretty(export).context("failed to serialize onboard JSON")?;
+    bytes.push(b'\n');
+    fs::write(path, bytes).with_context(|| format!("failed to write {}", path.display()))
+}
+
+pub fn load_export(path: &Path) -> Result<OnboardExport> {
+    let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed to parse onboard JSON {}", path.display()))
+}
+
+pub fn repack_export_macros(export: &mut OnboardExport) -> Result<()> {
+    let macro_ids = macro_sector_ids(&export.description, &export.directory.entries)?;
+    let mut macros = Vec::new();
+    let mut targets = Vec::new();
+    for (profile_index, profile) in export.profiles.iter().enumerate() {
+        for (gshift, bindings) in [(false, &profile.bindings), (true, &profile.gshift_bindings)] {
+            for (binding_index, binding) in bindings.iter().enumerate() {
+                if matches!(parse_binding(&binding.binding)?, Binding::Macro { .. }) {
+                    macros.push(binding.r#macro.clone().with_context(|| {
+                        format!(
+                            "profile {} {}{} has a macro binding without decoded steps",
+                            profile.index,
+                            if gshift { "G-Shift " } else { "" },
+                            binding.control
+                        )
+                    })?);
+                    targets.push((profile_index, gshift, binding_index));
+                }
+            }
+        }
+    }
+    let (sectors, locations) = pack_macros(&macros, &macro_ids, export.description.sector_size)?;
+    for ((profile_index, gshift, binding_index), (sector, offset)) in
+        targets.into_iter().zip(locations)
+    {
+        let bindings = if gshift {
+            &mut export.profiles[profile_index].gshift_bindings
+        } else {
+            &mut export.profiles[profile_index].bindings
+        };
+        let binding = Binding::Macro { sector, offset };
+        bindings[binding_index].binding = binding.to_string();
+        bindings[binding_index].raw_hex = encode_hex(&binding.encode()?);
+    }
+    export.macro_sectors = sectors
+        .into_iter()
+        .map(|(sector, bytes)| RawSector {
+            sector,
+            raw_hex: encode_hex(&bytes),
+        })
+        .collect();
+    Ok(())
+}
+
+pub fn import_plan(
+    exported: &OnboardExport,
+    current: &SectorDump,
+    device_type: &str,
+) -> Result<Vec<SectorDiff>> {
+    ensure!(
+        exported.version == EXPORT_VERSION,
+        "unsupported onboard export version {}",
+        exported.version
+    );
+    ensure!(
+        exported.device_type.eq_ignore_ascii_case(device_type),
+        "export device type {} does not match target {device_type}",
+        exported.device_type
+    );
+    ensure!(
+        exported.description.raw == current.description.raw,
+        "export description does not match the target device"
+    );
+    ensure!(
+        Description::parse(exported.description.raw)? == exported.description,
+        "export description fields do not match description.raw"
+    );
+    let current_sectors = sector_map(current)?;
+    let mut normalized = exported.clone();
+    if export_macros_need_repack(&normalized)? {
+        repack_export_macros(&mut normalized)?;
+    }
+    let mut desired = raw_export_sector_map(&normalized)?;
+    reencode_directory(&normalized, &mut desired)?;
+    reencode_profiles(&normalized, &mut desired)?;
+    ensure!(
+        desired.keys().eq(current_sectors.keys()),
+        "export sector set does not match the target sector set"
+    );
+    Ok(desired
+        .into_iter()
+        .filter_map(|(sector, replacement)| {
+            let current = current_sectors.get(&sector).unwrap();
+            (current != &replacement).then(|| SectorDiff {
+                sector,
+                current_crc: sector_crc(current),
+                replacement_crc: sector_crc(&replacement),
+                current: current.clone(),
+                replacement,
+            })
+        })
+        .collect::<Vec<_>>())
+}
+
+fn export_macros_need_repack(export: &OnboardExport) -> Result<bool> {
+    let desired = raw_export_sector_map(export)?;
+    let ids = macro_sector_ids(&export.description, &export.directory.entries)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for profile in &export.profiles {
+        let raw = decode_hex(&profile.raw_sector_hex)?;
+        for (base, bindings) in [
+            (BUTTONS_OFFSET, &profile.bindings),
+            (GSHIFT_BUTTONS_OFFSET, &profile.gshift_bindings),
+        ] {
+            for (index, binding) in bindings.iter().enumerate() {
+                let raw_binding = Binding::decode(
+                    raw[base + index * 4..base + index * 4 + 4]
+                        .try_into()
+                        .unwrap(),
+                );
+                let imported = parse_binding(&binding.binding)?;
+                if matches!(raw_binding, Binding::Macro { .. })
+                    != matches!(imported, Binding::Macro { .. })
+                {
+                    return Ok(true);
+                }
+                if let Binding::Macro { sector, offset } = imported {
+                    let Some(expected) = &binding.r#macro else {
+                        bail!(
+                            "{} has a macro binding without decoded steps",
+                            binding.control
+                        );
+                    };
+                    match decode_macro(&desired, &ids, sector, offset) {
+                        Ok(actual) if actual == *expected => {}
+                        _ => return Ok(true),
+                    }
+                } else if binding.r#macro.is_some() {
+                    bail!("{} has macro steps but is not macro-bound", binding.control);
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn raw_export_sector_map(export: &OnboardExport) -> Result<BTreeMap<u16, Vec<u8>>> {
+    let size = usize::from(export.description.sector_size);
+    let mut sectors = BTreeMap::new();
+    insert_export_sector(
+        &mut sectors,
+        0,
+        decode_hex(&export.directory.raw_sector_hex)?,
+        size,
+    )?;
+    for profile in &export.profiles {
+        insert_export_sector(
+            &mut sectors,
+            profile.sector,
+            decode_hex(&profile.raw_sector_hex)?,
+            size,
+        )?;
+    }
+    for macro_sector in &export.macro_sectors {
+        insert_export_sector(
+            &mut sectors,
+            macro_sector.sector,
+            decode_hex(&macro_sector.raw_hex)?,
+            size,
+        )?;
+    }
+    Ok(sectors)
+}
+
+fn insert_export_sector(
+    sectors: &mut BTreeMap<u16, Vec<u8>>,
+    sector: u16,
+    bytes: Vec<u8>,
+    size: usize,
+) -> Result<()> {
+    ensure!(
+        bytes.len() == size,
+        "sector 0x{sector:04X} has the wrong size"
+    );
+    ensure!(
+        sector_crc_valid(&bytes),
+        "sector 0x{sector:04X} CRC is invalid"
+    );
+    ensure!(
+        sectors.insert(sector, bytes).is_none(),
+        "export contains duplicate sector 0x{sector:04X}"
+    );
+    Ok(())
+}
+
+fn reencode_directory(export: &OnboardExport, sectors: &mut BTreeMap<u16, Vec<u8>>) -> Result<()> {
+    ensure!(
+        export.directory.entries.len() == usize::from(export.description.profile_count),
+        "export directory entry count is incorrect"
+    );
+    let directory = sectors.get_mut(&0).unwrap();
+    for (index, entry) in export.directory.entries.iter().enumerate() {
+        ensure!(
+            entry.index == index + 1
+                && (1..=u16::from(export.description.profile_count)).contains(&entry.sector),
+            "export directory entry {} has an invalid index or sector",
+            index + 1
+        );
+        let offset = index * 4;
+        directory[offset..offset + 2].copy_from_slice(&entry.sector.to_be_bytes());
+        directory[offset + 2] = u8::from(entry.enabled);
+        directory[offset + 3] = 0;
+    }
+    let terminator = export.directory.entries.len() * 4;
+    directory[terminator..terminator + 2].copy_from_slice(&[0xFF, 0xFF]);
+    update_sector_crc(directory)?;
+    parse_directory(directory, export.description.profile_count)?;
+    Ok(())
+}
+
+fn reencode_profiles(export: &OnboardExport, sectors: &mut BTreeMap<u16, Vec<u8>>) -> Result<()> {
+    let keyboard = export.device_type.eq_ignore_ascii_case("KEYBOARD");
+    let count = BUTTON_COUNT.min(usize::from(export.description.button_count));
+    ensure!(
+        export.profiles.len() == export.directory.entries.len(),
+        "export profile count does not match directory"
+    );
+    for (profile, entry) in export.profiles.iter().zip(&export.directory.entries) {
+        ensure!(
+            profile.index == entry.index
+                && profile.sector == entry.sector
+                && profile.enabled == entry.enabled,
+            "export profile {} does not match its directory entry",
+            profile.index
+        );
+        ensure!(
+            profile.bindings.len() == count && profile.gshift_bindings.len() == count,
+            "profile {} binding count does not match device button_count",
+            profile.index
+        );
+        let sector = sectors.get_mut(&profile.sector).unwrap();
+        set_profile_name_optional(sector, profile.name.as_deref())?;
+        if let Some(rate) = profile.rate_hz {
+            set_rate(sector, rate, export.description.profile_format_id)?;
+        }
+        match (&profile.dpi, keyboard) {
+            (Some(table), false) => set_dpi_table(sector, table)?,
+            (None, true) => {}
+            (Some(_), true) => bail!("keyboard export must not contain a DPI table"),
+            (None, false) => {}
+        }
+        apply_export_bindings(
+            sector,
+            &profile.bindings,
+            false,
+            export.description.button_count,
+        )?;
+        apply_export_bindings(
+            sector,
+            &profile.gshift_bindings,
+            true,
+            export.description.button_count,
+        )?;
+        ensure!(
+            profile.led_slots.len() == LED_SLOT_COUNT,
+            "profile {} must contain four LED slots",
+            profile.index
+        );
+        for (slot, led) in profile.led_slots.iter().enumerate() {
+            ensure!(led.slot == slot, "LED slot indices must be 0..=3 in order");
+            let raw = decode_hex(&led.raw_hex)?;
+            ensure!(raw.len() == LED_SLOT_SIZE, "LED slot must contain 11 bytes");
+            ensure!(
+                raw[0] == led.raw_id && encode_hex(&raw[1..]) == led.parameters_hex,
+                "LED slot {} decoded fields do not match raw_hex",
+                led.slot
+            );
+            let offset = LED_SLOTS_OFFSET + slot * LED_SLOT_SIZE;
+            sector[offset..offset + LED_SLOT_SIZE].copy_from_slice(&raw);
+        }
+        update_sector_crc(sector)?;
+    }
+    Ok(())
+}
+
+fn apply_export_bindings(
+    sector: &mut [u8],
+    bindings: &[ExportBinding],
+    gshift: bool,
+    button_count: u8,
+) -> Result<()> {
+    for (index, binding) in bindings.iter().enumerate() {
+        ensure!(
+            binding.number == index + 1,
+            "binding numbers must be sequential starting at 1"
+        );
+        let imported = parse_binding(&binding.binding)?;
+        let raw = decode_hex(&binding.raw_hex)?;
+        if raw.len() == 4 && Binding::decode(raw.as_slice().try_into().unwrap()) == imported {
+            let base = if gshift {
+                GSHIFT_BUTTONS_OFFSET
+            } else {
+                BUTTONS_OFFSET
+            };
+            let offset = base + index * 4;
+            sector[offset..offset + 4].copy_from_slice(&raw);
+            update_sector_crc(sector)?;
+        } else {
+            set_button(sector, binding.number, gshift, &imported, button_count)?;
+        }
+    }
+    Ok(())
+}
+
+fn sector_map(dump: &SectorDump) -> Result<BTreeMap<u16, Vec<u8>>> {
+    let expected = (0..u16::from(dump.description.sector_count)).collect::<BTreeSet<_>>();
+    let sectors = dump.sectors.iter().cloned().collect::<BTreeMap<_, _>>();
+    ensure!(
+        sectors.len() == dump.sectors.len(),
+        "sector set contains duplicate sector ids"
+    );
+    ensure!(
+        sectors.keys().copied().collect::<BTreeSet<_>>() == expected,
+        "sector set is incomplete for sector_count {}",
+        dump.description.sector_count
+    );
+    for (sector, bytes) in &sectors {
+        ensure!(
+            bytes.len() == usize::from(dump.description.sector_size),
+            "sector 0x{sector:04X} has the wrong size"
+        );
+        ensure!(
+            sector_crc_valid(bytes),
+            "sector 0x{sector:04X} CRC is invalid"
+        );
+    }
+    Ok(sectors)
+}
+
+fn sector_crc(bytes: &[u8]) -> u16 {
+    u16::from_be_bytes([bytes[bytes.len() - 2], bytes[bytes.len() - 1]])
+}
+
 pub fn encode_dump(dump: &SectorDump) -> Result<Vec<u8>> {
     ensure!(
         dump.sectors.len() <= usize::from(u16::MAX),
@@ -929,15 +2160,16 @@ pub fn decode_dump(data: &[u8]) -> Result<SectorDump> {
         .find(|(sector, _)| *sector == 0)
         .map(|(_, bytes)| bytes)
         .context("dump does not contain profile directory sector 0")?;
-    let mut expected = BTreeSet::from([0_u16]);
-    expected.extend(
+    let mut profile_only = BTreeSet::from([0_u16]);
+    profile_only.extend(
         parse_directory(directory, description.profile_count)?
             .into_iter()
             .map(|entry| entry.sector),
     );
+    let all_sectors = (0..u16::from(description.sector_count)).collect::<BTreeSet<_>>();
     ensure!(
-        seen == expected,
-        "dump sector set does not match its profile directory"
+        seen == profile_only || seen == all_sectors,
+        "dump sector set is neither a legacy profile-only backup nor a complete device backup"
     );
     Ok(SectorDump {
         description,
@@ -988,6 +2220,7 @@ mod tests {
                 modifiers: 3,
                 usage: 0x06,
             },
+            Binding::Consumer(0x00E9),
             Binding::Macro {
                 sector: 0x002A,
                 offset: 0x1234,
@@ -1041,6 +2274,23 @@ mod tests {
         assert_eq!(parse_key_combo("WIN+L").unwrap(), (8, 0x0F));
         assert_eq!(parse_key_combo("f11").unwrap(), (0, 0x44));
         assert_eq!(parse_key_combo("Ctrl+Shift+Esc").unwrap(), (3, 0x29));
+        assert_eq!(parse_key_combo("right-ctrl+f5").unwrap(), (0x10, 0x3E));
+        assert_eq!(parse_key_combo("usage_0x64").unwrap(), (0, 0x64));
+        assert_eq!(
+            parse_binding("key:volume_up").unwrap(),
+            Binding::Consumer(0x00E9)
+        );
+        assert_eq!(
+            parse_binding("consumer:play-pause").unwrap(),
+            Binding::Consumer(0x00CD)
+        );
+        assert_eq!(
+            parse_binding("key:ctrl").unwrap(),
+            Binding::Key {
+                modifiers: 1,
+                usage: 0
+            }
+        );
         assert!(parse_key_combo("ctrl+").is_err());
         assert!(parse_key_combo("ctrl+c+d").is_err());
         assert!(parse_key_combo("hyper+c").is_err());
@@ -1176,6 +2426,107 @@ mod tests {
         update_sector_crc(&mut sector).unwrap();
         assert!(set_rate(&mut sector, 1000, 6).is_err());
         assert!(set_rate(&mut sector, 1000, 5).is_ok());
+    }
+
+    #[test]
+    fn encodes_led_slot_with_rgb_effect_layout_and_crc() {
+        let mut sector = vec![0xFF; 255];
+        update_sector_crc(&mut sector).unwrap();
+        let options = EffectOptions {
+            color: Some(crate::lighting::rgb::RgbColor { r: 1, g: 2, b: 3 }),
+            ..Default::default()
+        };
+        set_led_slot(&mut sector, 2, Effect::parse("fixed").unwrap(), &options).unwrap();
+        assert_eq!(
+            &sector[LED_SLOTS_OFFSET + 2 * LED_SLOT_SIZE..LED_SLOTS_OFFSET + 3 * LED_SLOT_SIZE],
+            &[0x01, 1, 2, 3, 2, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(led_slots(&sector).unwrap()[2].effect, "fixed");
+        assert!(sector_crc_valid(&sector));
+    }
+
+    #[test]
+    fn macro_codec_round_trips_bytes_across_jump_and_aligns_end() {
+        let empty = Macro { steps: vec![] };
+        assert_eq!(encode_macro(&empty).unwrap(), [0xFF, 0xFF]);
+        let odd_before_end = Macro {
+            steps: vec![MacroStep::WaitForRelease {
+                wait_for_release: true,
+            }],
+        };
+        assert_eq!(encode_macro(&odd_before_end).unwrap(), [0x01, 0xFF]);
+
+        let value = Macro {
+            steps: vec![
+                MacroStep::Key {
+                    key: "ctrl+shift+c".into(),
+                },
+                MacroStep::Delay { delay_ms: 100 },
+                MacroStep::Text { text: "Hi!".into() },
+                MacroStep::Consumer {
+                    consumer: "volume_up".into(),
+                },
+                MacroStep::WaitForRelease {
+                    wait_for_release: true,
+                },
+            ],
+        };
+        let ids = [2, 3, 4, 5];
+        let (packed, locations) = pack_macros(&[value], &ids, 18).unwrap();
+        assert!(packed.iter().any(|(_, bytes)| bytes[..16].contains(&0x60)));
+        let map = packed.into_iter().collect::<BTreeMap<_, _>>();
+        let decoded = decode_macro(
+            &map,
+            &ids.into_iter().collect(),
+            locations[0].0,
+            locations[0].1,
+        )
+        .unwrap();
+        let (repacked, _) = pack_macros(&[decoded], &ids, 18).unwrap();
+        assert_eq!(map, repacked.into_iter().collect());
+    }
+
+    #[test]
+    fn export_import_json_round_trips_synthetic_full_sector_set() {
+        let raw = [1, 4, 1, 1, 0, 5, 4, 0, 0xFF, 0, 0, 0, 0, 0, 0, 0];
+        let description = Description::parse(raw).unwrap();
+        let mut directory = vec![0xFF; 255];
+        directory[..6].copy_from_slice(&[0, 1, 1, 0, 0xFF, 0xFF]);
+        update_sector_crc(&mut directory).unwrap();
+
+        let value = Macro {
+            steps: vec![MacroStep::Key { key: "f5".into() }],
+        };
+        let (macro_sectors, locations) = pack_macros(&[value], &[2, 3], 255).unwrap();
+        let mut profile = vec![0xFF; 255];
+        profile[0] = 1;
+        update_sector_crc(&mut profile).unwrap();
+        set_profile_name(&mut profile, "Keyboard").unwrap();
+        set_button(
+            &mut profile,
+            1,
+            false,
+            &Binding::Macro {
+                sector: locations[0].0,
+                offset: locations[0].1,
+            },
+            5,
+        )
+        .unwrap();
+        let dump = SectorDump {
+            description,
+            sectors: vec![
+                (0, directory),
+                (1, profile),
+                macro_sectors[0].clone(),
+                macro_sectors[1].clone(),
+            ],
+        };
+        let exported = export_state(&dump, "KEYBOARD").unwrap();
+        let json = serde_json::to_string_pretty(&exported).unwrap();
+        let decoded: OnboardExport = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, exported);
+        assert!(import_plan(&decoded, &dump, "KEYBOARD").unwrap().is_empty());
     }
 
     #[test]

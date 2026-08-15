@@ -711,7 +711,7 @@ fn parse_effect_specific_info(info_type: u8, response: &[u8; 16]) -> Result<Effe
     }
 }
 
-fn raw_effect_name(id: u16) -> &'static str {
+pub fn raw_effect_name(id: u16) -> &'static str {
     match id {
         0x00 => "off",
         0x01 => "fixed",
