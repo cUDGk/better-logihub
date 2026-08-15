@@ -33,6 +33,11 @@ G HUB の設定データベースからプロファイル (DPI テーブル・�
 | 明るさの取得・設定 | `logihub brightness` / `brightness set 50` | 0x8040 |
 | ファームウェア RGB エフェクト | `logihub rgb info` / `rgb set ...` | 0x8071 |
 | キー単位 RGB フレーム | `logihub perkey set a=FF0000 ...` | 0x8081 |
+| G キー情報・software mode | `logihub gkeys info` / `gkeys software-mode on` | 0x8010 |
+| M1/M2/M3・MR LED | `logihub mkeys set m1` / `mr on` | 0x8020 / 0x8030 |
+| 特殊キー一覧・divert・remap | `logihub keys list` / `keys divert ...` | 0x1B04 |
+| HID++ 入力イベント監視 | `logihub watch --device 3` | 0x8010 / 0x8020 / 0x8030 / 0x1B04 |
+| G キー・特殊キー常駐割り当て | `logihub daemon` | HID++ 通知 + Windows SendInput |
 | G HUB プロファイル移行 | `logihub profile import-ghub` | settings.db (SQLite) |
 | プロファイル適用 | `logihub profile apply Desktop` | — |
 | オンボードボタン割り当て | `logihub buttons set 7 key:ctrl+c` | 0x8100 |
@@ -116,6 +121,36 @@ logihub perkey clear --zone-scheme hidusage --device 3
 # A/B キーに候補ごとの色を書き、観察結果を入力する。方式は自動決定しない
 logihub perkey probe --device 3
 
+# G キー数と getPhysicalLayout の raw BE16 値
+logihub gkeys info --device 3
+
+# software mode 中は通常の F キー出力が止まる。確認後は必ず off に戻す
+logihub gkeys software-mode on --device 3
+logihub watch --device 3
+logihub gkeys software-mode off --device 3
+
+# M キーと MR の LED
+logihub mkeys set m1 --device 3
+logihub mkeys set none --device 3
+logihub mr on --device 3
+logihub mr off --device 3
+
+# reprogrammable control の CID、task、capability、現在の reporting 状態
+logihub keys list --device 3
+logihub keys list --device 1
+
+# 一時 divert。--persist はデバイスの永続設定を変更するので通常は付けない
+logihub keys divert play-pause on --device 3
+logihub keys divert play-pause off --device 3
+logihub keys divert 0x00c3 on --raw-xy on --device 1
+logihub keys divert 0x00c3 off --raw-xy off --device 1
+
+# source CID を target CID の native task へ一時 remap。group/gmask を検証してから送る
+logihub keys remap 0x0053 0x0056 --device 1
+
+# 全 CID reporting 設定をファームウェア既定へ戻す
+logihub keys reset --device 1
+
 # ボタンにショートカットを割り当て (マウス本体のメモリに書くので常駐ソフト不要)
 logihub onboard dump --out backup.bin --device 1   # 書き込み前のバックアップ (必須)
 logihub buttons set 7 key:ctrl+c --device 1
@@ -140,6 +175,53 @@ logihub onboard exec-macro 6 0 --device 1
 
 プロファイルは `%APPDATA%\better-logihub\profiles.json` に保存されます。
 
+## 常駐割り当て
+
+`logihub daemon` は `%APPDATA%\better-logihub\bindings.json` を読みます。ファイルがなければ安全な例を作成して終了するので、編集後にもう一度起動してください。`--config <path>` で別のファイルも指定できます。
+
+```json
+{
+  "devices": {
+    "g915": {
+      "gkeys": {
+        "g1": { "keys": "ctrl+shift+c" },
+        "g2": { "text": "定型文" },
+        "g3": { "run": "C:\\Tools\\app.exe --flag" },
+        "g4": {
+          "macro": [
+            { "keys": "ctrl+l" },
+            { "delay_ms": 50 },
+            { "text": "https://example.com" },
+            { "keys": "enter" }
+          ]
+        },
+        "g5": { "none": true }
+      },
+      "cids": {
+        "play-pause": { "keys": "media-play-pause" }
+      }
+    },
+    "0x409f": {
+      "gkeys": {},
+      "cids": {
+        "gesture-navigation": { "keys": "win+tab" }
+      }
+    }
+  }
+}
+```
+
+デバイスキーは内蔵データの `model_id` または `0x` 付き PID です。CID は `keys list` に出る数値または名前を指定します。`keys` は `ctrl` / `shift` / `alt` / `win`、英数字、F1〜F24、Enter、Esc、Tab、Space、矢印、再生・曲送り・音量系メディアキーに対応します。`run` は `cmd.exe /D /S /C` で起動します。
+
+入力は held mask の変化から判定し、押下 edge で一度だけ action を実行、release edge は状態だけ更新します。キーリピートは行いません。Ctrl+C、Ctrl+Break、コンソール close/logoff/shutdown 時には G-key software mode を off、daemon が divert した CID を non-persistent な通常入力へ戻します。0x1D4B の再構成/電源投入通知では割り当てを再適用します。
+
+```bash
+logihub daemon
+logihub daemon --config C:\path\bindings.json --verbose
+```
+
+`watch --json` はイベントごとに 1 JSON object を1行で出力します。daemon の `--verbose` は decoded event に加えて raw HID++ frame を stdout に記録します。
+
 ## 制限事項
 
 - ボタン割り当てはオンボードメモリ書き込みで対応 (`buttons set`)。キーストローク・マウスボタン・特殊操作・既存マクロ参照を割り当て可能。マクロ作成は対象外
@@ -148,6 +230,9 @@ logihub onboard exec-macro 6 0 --device 1
 - `perkey frame --from` は `{"a":"FF0000","esc":"00FF00"}` 形式です。`--persist` を付けない限り RAM フレームだけを書きます
 - オンボード書き込みは毎回「事前バックアップ必須 → CRC 検証 → 書き込み → 読み戻し照合」を通ります。壊れたら `onboard restore` で戻せます
 - 電源オフ / スリープ中の無線デバイスは `unreachable` と表示されます (レシーバーの仕様)
+- `gkeys info` の physical layout は仕様上「layout id」か「物理 G-key bitmask」か未確定のため、解釈せず raw BE16 として表示します
+- `bindings.json` は標準の press/release edge と単純 macro step を扱う軽量モデルです。G-Shift、M1〜M3、FN ごとの別 assignment map、hold/double-click/toggle/repeat macro は未実装です
+- daemon の復元処理は通常の Ctrl+C/console 終了通知で動きます。タスクマネージャーの「プロセスの終了」や電源断のようにプロセスへ猶予を与えない強制終了は捕捉できません
 
 ## 参考
 

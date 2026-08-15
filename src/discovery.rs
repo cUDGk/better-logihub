@@ -32,6 +32,7 @@ pub struct ListRow {
 pub struct ManagedDevice {
     pub index: usize,
     pub name: String,
+    pub pid: Option<u16>,
     pub model: Option<&'static DeviceRecord>,
     pub device: Device,
 }
@@ -225,6 +226,7 @@ pub fn discover() -> Result<Discovery> {
             devices.push(ManagedDevice {
                 index: next_index,
                 name,
+                pid: Some(group.product_id),
                 model: physical_model,
                 device,
             });
@@ -360,6 +362,7 @@ fn push_wireless_device(
     devices.push(ManagedDevice {
         index: *next_index,
         name,
+        pid: wireless_pid,
         model,
         device,
     });

@@ -1,4 +1,6 @@
 use std::rc::Rc;
+use std::thread;
+use std::time::Duration;
 
 use serde::Serialize;
 
@@ -16,6 +18,8 @@ const FEATURE_EXTENDED_ADJUSTABLE_DPI: u16 = 0x2202;
 const FEATURE_REPORT_RATE: u16 = 0x8060;
 const FEATURE_EXTENDED_REPORT_RATE: u16 = 0x8061;
 const FEATURE_ONBOARD_PROFILES: u16 = 0x8100;
+const SLEEP_RETRIES: usize = 3;
+const SLEEP_RETRY_DELAY: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct BatteryStatus {
@@ -180,10 +184,14 @@ impl Device {
             .ok_or(HidppError::UnsupportedFeature(feature_id))
     }
 
-    fn get_feature(&self, feature_id: u16) -> Result<Option<u8>, HidppError> {
+    pub(crate) fn feature_index(&self, feature_id: u16) -> Result<Option<u8>, HidppError> {
         let params = feature_id.to_be_bytes();
         let response = self.call(0, 0, &params)?;
         Ok((response[0] != 0).then_some(response[0]))
+    }
+
+    fn get_feature(&self, feature_id: u16) -> Result<Option<u8>, HidppError> {
+        self.feature_index(feature_id)
     }
 
     fn call(&self, feature_idx: u8, function: u8, params: &[u8]) -> Result<[u8; 16], HidppError> {
@@ -197,7 +205,7 @@ impl Device {
         params: &[u8],
     ) -> Result<[u8; 16], HidppError> {
         let request = long_frame(self.dev_idx, feature_idx, fn_sw(function, 0), params);
-        let response = self.transport.transact_hidpp20(&request)?;
+        let response = self.transact_with_sleep_retry(&request)?;
         let mut result = [0_u8; 16];
         result.copy_from_slice(response.params());
         Ok(result)
@@ -219,8 +227,31 @@ impl Device {
         short_params[0] = fn_sw(function, 0);
         short_params[1..1 + params.len()].copy_from_slice(params);
         let request = short_frame(self.dev_idx, feature_idx, short_params);
-        let response = self.transport.transact_hidpp20(&request)?;
+        let response = self.transact_with_sleep_retry(&request)?;
         Ok(response.params().to_vec())
+    }
+
+    pub(crate) fn transport(&self) -> Rc<HidTransport> {
+        Rc::clone(&self.transport)
+    }
+
+    pub(crate) fn device_index(&self) -> u8 {
+        self.dev_idx
+    }
+
+    fn transact_with_sleep_retry(
+        &self,
+        request: &[u8],
+    ) -> Result<super::transport::Packet, HidppError> {
+        for attempt in 0..SLEEP_RETRIES {
+            match self.transport.transact_hidpp20(request) {
+                Err(HidppError::Hidpp10 { code: 8, .. }) if attempt + 1 < SLEEP_RETRIES => {
+                    thread::sleep(SLEEP_RETRY_DELAY);
+                }
+                result => return result,
+            }
+        }
+        unreachable!()
     }
 }
 

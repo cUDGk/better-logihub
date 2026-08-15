@@ -1,4 +1,6 @@
 use std::cell::Cell;
+use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::fmt;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -131,6 +133,7 @@ pub struct HidTransport {
     short: Option<Rc<HidDevice>>,
     long: Option<Rc<HidDevice>>,
     swid: Cell<SwidState>,
+    pending: RefCell<VecDeque<Packet>>,
 }
 
 impl HidTransport {
@@ -147,6 +150,7 @@ impl HidTransport {
             short: short.map(Rc::new),
             long: long.map(Rc::new),
             swid: Cell::new(SwidState::new()),
+            pending: RefCell::new(VecDeque::new()),
         })
     }
 
@@ -156,6 +160,7 @@ impl HidTransport {
             short: Some(Rc::clone(&device)),
             long: Some(device),
             swid: Cell::new(SwidState::new()),
+            pending: RefCell::new(VecDeque::new()),
         }
     }
 
@@ -225,7 +230,10 @@ impl HidTransport {
                     };
                     match response_match {
                         ResponseMatch::Matched => return Ok(packet),
-                        ResponseMatch::Unrelated => continue,
+                        ResponseMatch::Unrelated => {
+                            self.queue_unrelated(packet);
+                            continue;
+                        }
                         ResponseMatch::SwidConflict => {
                             swid_conflict = true;
                             break;
@@ -252,6 +260,49 @@ impl HidTransport {
             }
         }
         unreachable!()
+    }
+
+    /// Read the next queued or live packet without issuing a request.
+    ///
+    /// `transact` puts unrelated packets here instead of dropping them, so a
+    /// notification that races a response remains available to the listener.
+    pub fn read_packet_timeout(&self, timeout: Duration) -> Result<Option<Packet>, HidppError> {
+        if let Some(packet) = self.pending.borrow_mut().pop_front() {
+            return Ok(Some(packet));
+        }
+
+        let deadline = Instant::now() + timeout;
+        let devices = self.read_devices();
+        while Instant::now() < deadline {
+            for device in &devices {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return Ok(None);
+                }
+                let poll = remaining.min(READ_POLL_TIMEOUT);
+                let timeout_ms = poll.as_millis().clamp(1, i32::MAX as u128) as i32;
+                let mut buffer = [0_u8; LONG_LEN];
+                let count = device
+                    .read_timeout(&mut buffer, timeout_ms)
+                    .map_err(|error| HidppError::Io(error.to_string()))?;
+                if count == 0 {
+                    continue;
+                }
+                if let Ok(packet) = Packet::new(&buffer[..count]) {
+                    return Ok(Some(packet));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn queue_unrelated(&self, packet: Packet) {
+        const MAX_PENDING: usize = 256;
+        let mut pending = self.pending.borrow_mut();
+        if pending.len() == MAX_PENDING {
+            pending.pop_front();
+        }
+        pending.push_back(packet);
     }
 
     fn read_devices(&self) -> Vec<&HidDevice> {

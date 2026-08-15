@@ -1,10 +1,16 @@
+mod bindings;
+mod daemon;
 mod device_data;
 mod discovery;
+mod gkeys;
 mod hidpp;
 mod lighting;
+mod listener;
+mod mkeys;
 mod onboard;
 mod output;
 mod profile;
+mod specialkeys;
 
 use std::fs;
 use std::io::{self, Write};
@@ -16,6 +22,7 @@ use serde::Serialize;
 
 use device_data::DeviceRecord;
 use discovery::{Discovery, ManagedDevice, discover, error_text};
+use gkeys::GKeys;
 use hidpp::device::{BatteryStatus, FeatureInfo};
 use lighting::brightness::{
     Brightness, BrightnessInfo, percent_from_raw as brightness_percent,
@@ -39,6 +46,7 @@ use profile::{
     Profile, default_ghub_db_path, default_store_path, import_ghub_database, load_store,
     merge_profiles, save_store,
 };
+use specialkeys::{CidReporting, ReportingUpdate, SpecialKeys, ensure_can_remap, resolve_cid};
 
 #[derive(Debug, Parser)]
 #[command(name = "logihub", version, about = "Lightweight Logitech HID++ CLI")]
@@ -117,6 +125,131 @@ enum Command {
         #[arg(long, global = true, value_enum)]
         zone_scheme: Option<ZoneSchemeArg>,
     },
+    /// Inspect or divert dedicated G-keys (0x8010).
+    Gkeys {
+        #[command(subcommand)]
+        command: GKeysCommand,
+    },
+    /// Set M1/M2/M3 indicator LEDs (0x8020).
+    Mkeys {
+        #[command(subcommand)]
+        command: MKeysCommand,
+    },
+    /// Set the macro-record indicator LED (0x8030).
+    Mr {
+        state: OnOff,
+        #[arg(long)]
+        device: Option<usize>,
+    },
+    /// Inspect, divert, remap, or reset reprogrammable controls (0x1B04).
+    Keys {
+        #[command(subcommand)]
+        command: KeysCommand,
+    },
+    /// Print decoded HID++ notifications until Ctrl+C.
+    Watch {
+        #[arg(long)]
+        device: Option<usize>,
+    },
+    /// Run configured G-key and special-key bindings until stopped.
+    Daemon {
+        #[arg(long)]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        verbose: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum GKeysCommand {
+    Info {
+        #[arg(long)]
+        device: Option<usize>,
+    },
+    SoftwareMode {
+        state: OnOff,
+        #[arg(long)]
+        device: Option<usize>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MKeysCommand {
+    Set {
+        key: MKeySelection,
+        #[arg(long)]
+        device: Option<usize>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum KeysCommand {
+    List {
+        #[arg(long)]
+        device: Option<usize>,
+    },
+    Divert {
+        cid: String,
+        state: OnOff,
+        #[arg(long)]
+        persist: bool,
+        #[arg(long, value_enum)]
+        raw_xy: Option<OnOff>,
+        #[arg(long)]
+        device: Option<usize>,
+    },
+    Remap {
+        #[arg(value_parser = parse_u16_arg)]
+        cid: u16,
+        #[arg(value_parser = parse_u16_arg)]
+        target_cid: u16,
+        #[arg(long)]
+        device: Option<usize>,
+    },
+    Reset {
+        #[arg(long)]
+        device: Option<usize>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum OnOff {
+    On,
+    Off,
+}
+
+impl OnOff {
+    fn enabled(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum MKeySelection {
+    M1,
+    M2,
+    M3,
+    None,
+}
+
+impl MKeySelection {
+    fn mask(self) -> u8 {
+        match self {
+            Self::M1 => 0x01,
+            Self::M2 => 0x02,
+            Self::M3 => 0x04,
+            Self::None => 0,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::M1 => "m1",
+            Self::M2 => "m2",
+            Self::M3 => "m3",
+            Self::None => "none",
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -555,6 +688,61 @@ struct PerKeyProbeResult {
     status: String,
 }
 
+#[derive(Serialize)]
+struct GKeysInfoResult {
+    device: usize,
+    name: String,
+    count: u8,
+    physical_layout: u16,
+    physical_layout_hex: String,
+}
+
+#[derive(Serialize)]
+struct FeatureWriteResult {
+    device: usize,
+    name: String,
+    feature: String,
+    value: String,
+    status: String,
+}
+
+#[derive(Serialize)]
+struct SpecialKeyRow {
+    device: usize,
+    index: u8,
+    cid: u16,
+    cid_hex: String,
+    name: String,
+    task_id: u16,
+    task_hex: String,
+    flags_raw: u8,
+    additional_flags_raw: u8,
+    flags: Vec<String>,
+    position: u8,
+    group: u8,
+    group_mask: u8,
+    reporting: Option<CidReporting>,
+    reporting_error: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SpecialKeysListResult {
+    device: usize,
+    name: String,
+    capabilities: u8,
+    keys: Vec<SpecialKeyRow>,
+}
+
+#[derive(Serialize)]
+struct SpecialKeyWriteResult {
+    device: usize,
+    name: String,
+    cid: Option<u16>,
+    operation: String,
+    reporting: Option<CidReporting>,
+    status: String,
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -709,6 +897,57 @@ fn main() -> Result<()> {
                 }
             }
         }
+        Command::Gkeys { command } => {
+            let discovery = discover_with_warnings()?;
+            match command {
+                GKeysCommand::Info { device } => gkeys_info(&discovery, device, cli.json),
+                GKeysCommand::SoftwareMode { state, device } => {
+                    gkeys_software_mode(&discovery, device, state.enabled(), cli.json)
+                }
+            }
+        }
+        Command::Mkeys { command } => {
+            let discovery = discover_with_warnings()?;
+            match command {
+                MKeysCommand::Set { key, device } => mkeys_set(&discovery, device, key, cli.json),
+            }
+        }
+        Command::Mr { state, device } => {
+            let discovery = discover_with_warnings()?;
+            mr_set(&discovery, device, state.enabled(), cli.json)
+        }
+        Command::Keys { command } => {
+            let discovery = discover_with_warnings()?;
+            match command {
+                KeysCommand::List { device } => keys_list(&discovery, device, cli.json),
+                KeysCommand::Divert {
+                    cid,
+                    state,
+                    persist,
+                    raw_xy,
+                    device,
+                } => keys_divert(
+                    &discovery,
+                    device,
+                    &cid,
+                    state.enabled(),
+                    persist,
+                    raw_xy.map(OnOff::enabled),
+                    cli.json,
+                ),
+                KeysCommand::Remap {
+                    cid,
+                    target_cid,
+                    device,
+                } => keys_remap(&discovery, device, cid, target_cid, cli.json),
+                KeysCommand::Reset { device } => keys_reset(&discovery, device, cli.json),
+            }
+        }
+        Command::Watch { device } => {
+            let discovery = discover_with_warnings()?;
+            daemon::watch(&discovery, device, cli.json)
+        }
+        Command::Daemon { config, verbose } => daemon::run(config, verbose, cli.json),
     }
 }
 
@@ -1070,6 +1309,337 @@ fn features(discovery: &Discovery, index: Option<usize>, json: bool) -> Result<(
         &rows,
     );
     Ok(())
+}
+
+fn gkeys_info(discovery: &Discovery, index: Option<usize>, json: bool) -> Result<()> {
+    let target = single_device(discovery, index)?;
+    let gkeys = GKeys::new(&target.device)?;
+    let physical_layout = gkeys.get_physical_layout()?;
+    let result = GKeysInfoResult {
+        device: target.index,
+        name: target.name.clone(),
+        count: gkeys.get_count()?,
+        physical_layout,
+        physical_layout_hex: format!("0x{physical_layout:04X}"),
+    };
+    if json {
+        return print_json(&result);
+    }
+    print_table(
+        &["DEVICE", "NAME", "COUNT", "PHYSICAL LAYOUT (RAW BE16)"],
+        &[vec![
+            result.device.to_string(),
+            result.name,
+            result.count.to_string(),
+            result.physical_layout_hex,
+        ]],
+    );
+    Ok(())
+}
+
+fn gkeys_software_mode(
+    discovery: &Discovery,
+    index: Option<usize>,
+    enabled: bool,
+    json: bool,
+) -> Result<()> {
+    let target = single_device(discovery, index)?;
+    GKeys::new(&target.device)?.enable_software_control(enabled)?;
+    print_feature_write(
+        FeatureWriteResult {
+            device: target.index,
+            name: target.name.clone(),
+            feature: "gkeys-software-mode".into(),
+            value: if enabled { "on" } else { "off" }.into(),
+            status: "set".into(),
+        },
+        json,
+    )
+}
+
+fn mkeys_set(
+    discovery: &Discovery,
+    index: Option<usize>,
+    key: MKeySelection,
+    json: bool,
+) -> Result<()> {
+    let target = single_device(discovery, index)?;
+    let mkeys = mkeys::MKeys::new(&target.device)?;
+    let count = mkeys.get_count()?;
+    if !matches!(key, MKeySelection::None) {
+        let selected = match key {
+            MKeySelection::M1 => 1,
+            MKeySelection::M2 => 2,
+            MKeySelection::M3 => 3,
+            MKeySelection::None => unreachable!(),
+        };
+        ensure!(selected <= count, "device reports only {count} M-keys");
+    }
+    mkeys.set_leds(key.mask())?;
+    print_feature_write(
+        FeatureWriteResult {
+            device: target.index,
+            name: target.name.clone(),
+            feature: "mkey-led".into(),
+            value: key.name().into(),
+            status: "set".into(),
+        },
+        json,
+    )
+}
+
+fn mr_set(discovery: &Discovery, index: Option<usize>, enabled: bool, json: bool) -> Result<()> {
+    let target = single_device(discovery, index)?;
+    mkeys::MrKey::new(&target.device)?.set_led(enabled)?;
+    print_feature_write(
+        FeatureWriteResult {
+            device: target.index,
+            name: target.name.clone(),
+            feature: "mr-led".into(),
+            value: if enabled { "on" } else { "off" }.into(),
+            status: "set".into(),
+        },
+        json,
+    )
+}
+
+fn keys_list(discovery: &Discovery, index: Option<usize>, json: bool) -> Result<()> {
+    let target = single_device(discovery, index)?;
+    let keys = SpecialKeys::new(&target.device)?;
+    let capabilities = keys.capabilities()?;
+    let rows = keys
+        .all_cid_info()?
+        .into_iter()
+        .map(|info| {
+            let (reporting, reporting_error) = match keys.reporting(info.cid) {
+                Ok(reporting) => (Some(reporting), None),
+                Err(error) => (None, Some(error.to_string())),
+            };
+            let mut flags = info
+                .flags
+                .names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            flags.extend(info.additional_flags.names().into_iter().map(str::to_owned));
+            SpecialKeyRow {
+                device: target.index,
+                index: info.index,
+                cid: info.cid,
+                cid_hex: format!("0x{:04X}", info.cid),
+                name: info.name,
+                task_id: info.task_id,
+                task_hex: format!("0x{:04X}", info.task_id),
+                flags_raw: info.flags.raw,
+                additional_flags_raw: info.additional_flags.raw,
+                flags,
+                position: info.position,
+                group: info.group,
+                group_mask: info.group_mask,
+                reporting,
+                reporting_error,
+            }
+        })
+        .collect::<Vec<_>>();
+    let result = SpecialKeysListResult {
+        device: target.index,
+        name: target.name.clone(),
+        capabilities,
+        keys: rows,
+    };
+    if json {
+        return print_json(&result);
+    }
+    println!(
+        "device {} {} capabilities=0x{:02X}",
+        result.device, result.name, result.capabilities
+    );
+    let rows = result
+        .keys
+        .iter()
+        .map(|row| {
+            vec![
+                row.index.to_string(),
+                row.cid_hex.clone(),
+                row.name.clone(),
+                row.task_hex.clone(),
+                if row.flags.is_empty() {
+                    "-".into()
+                } else {
+                    row.flags.join(",")
+                },
+                row.reporting
+                    .map(|reporting| reporting.divert.to_string())
+                    .unwrap_or_else(|| "?".into()),
+                row.reporting_error.clone().unwrap_or_default(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    print_table(
+        &["INDEX", "CID", "NAME", "TASK", "FLAGS", "DIVERT", "ERROR"],
+        &rows,
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn keys_divert(
+    discovery: &Discovery,
+    index: Option<usize>,
+    cid_value: &str,
+    enabled: bool,
+    persist: bool,
+    raw_xy: Option<bool>,
+    json: bool,
+) -> Result<()> {
+    let target = single_device(discovery, index)?;
+    let keys = SpecialKeys::new(&target.device)?;
+    let cid = resolve_cid(cid_value)?;
+    let info = keys
+        .all_cid_info()?
+        .into_iter()
+        .find(|info| info.cid == cid)
+        .with_context(|| format!("CID 0x{cid:04X} is not present on this device"))?;
+    ensure!(
+        info.flags.divertable,
+        "CID 0x{cid:04X} ({}) is not divertable",
+        info.name
+    );
+    if persist {
+        ensure!(
+            info.flags.persistently_divertable,
+            "CID 0x{cid:04X} ({}) is not persistently divertable",
+            info.name
+        );
+    }
+    if raw_xy == Some(true) {
+        ensure!(
+            info.additional_flags.raw_xy,
+            "CID 0x{cid:04X} ({}) has no raw-XY capability",
+            info.name
+        );
+    }
+    let reporting = keys.update_reporting(
+        cid,
+        ReportingUpdate {
+            divert: Some(enabled),
+            persist: persist.then_some(enabled),
+            raw_xy,
+            ..Default::default()
+        },
+    )?;
+    print_special_write(
+        SpecialKeyWriteResult {
+            device: target.index,
+            name: target.name.clone(),
+            cid: Some(cid),
+            operation: format!(
+                "divert {}{}{}",
+                if enabled { "on" } else { "off" },
+                if persist { ", persist updated" } else { "" },
+                raw_xy
+                    .map(|value| if value { ", raw-xy on" } else { ", raw-xy off" })
+                    .unwrap_or("")
+            ),
+            reporting: Some(reporting),
+            status: "set and read back".into(),
+        },
+        json,
+    )
+}
+
+fn keys_remap(
+    discovery: &Discovery,
+    index: Option<usize>,
+    cid: u16,
+    target_cid: u16,
+    json: bool,
+) -> Result<()> {
+    let target = single_device(discovery, index)?;
+    let keys = SpecialKeys::new(&target.device)?;
+    let infos = keys.all_cid_info()?;
+    let source = infos
+        .iter()
+        .find(|info| info.cid == cid)
+        .with_context(|| format!("source CID 0x{cid:04X} is not present"))?;
+    let destination = infos
+        .iter()
+        .find(|info| info.cid == target_cid)
+        .with_context(|| format!("target CID 0x{target_cid:04X} is not present"))?;
+    ensure_can_remap(source, destination)?;
+    let reporting = keys.update_reporting(
+        cid,
+        ReportingUpdate {
+            remap: Some(target_cid),
+            ..Default::default()
+        },
+    )?;
+    print_special_write(
+        SpecialKeyWriteResult {
+            device: target.index,
+            name: target.name.clone(),
+            cid: Some(cid),
+            operation: format!("remap 0x{cid:04X} to 0x{target_cid:04X}"),
+            reporting: Some(reporting),
+            status: "set and read back".into(),
+        },
+        json,
+    )
+}
+
+fn keys_reset(discovery: &Discovery, index: Option<usize>, json: bool) -> Result<()> {
+    let target = single_device(discovery, index)?;
+    SpecialKeys::new(&target.device)?.reset_all()?;
+    print_special_write(
+        SpecialKeyWriteResult {
+            device: target.index,
+            name: target.name.clone(),
+            cid: None,
+            operation: "reset all CID reporting settings".into(),
+            reporting: None,
+            status: "reset".into(),
+        },
+        json,
+    )
+}
+
+fn print_feature_write(result: FeatureWriteResult, json: bool) -> Result<()> {
+    if json {
+        print_json(&result)
+    } else {
+        print_table(
+            &["DEVICE", "NAME", "FEATURE", "VALUE", "STATUS"],
+            &[vec![
+                result.device.to_string(),
+                result.name,
+                result.feature,
+                result.value,
+                result.status,
+            ]],
+        );
+        Ok(())
+    }
+}
+
+fn print_special_write(result: SpecialKeyWriteResult, json: bool) -> Result<()> {
+    if json {
+        print_json(&result)
+    } else {
+        print_table(
+            &["DEVICE", "NAME", "CID", "OPERATION", "STATUS"],
+            &[vec![
+                result.device.to_string(),
+                result.name,
+                result
+                    .cid
+                    .map(|cid| format!("0x{cid:04X}"))
+                    .unwrap_or_else(|| "all".into()),
+                result.operation,
+                result.status,
+            ]],
+        );
+        Ok(())
+    }
 }
 
 fn brightness_get(discovery: &Discovery, index: Option<usize>, json: bool) -> Result<()> {
