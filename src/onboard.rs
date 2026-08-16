@@ -109,10 +109,18 @@ pub struct DirectoryEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Binding {
     Mouse(u8),
-    Key { modifiers: u8, usage: u8 },
+    Key {
+        modifiers: u8,
+        usage: u8,
+    },
     Consumer(u16),
-    Macro { sector: u16, offset: u16 },
+    Macro {
+        sector: u16,
+        offset: u16,
+    },
     Special(u8),
+    /// 0x90 0x0D 0xFF <n>: switch to onboard profile n (libratbag ENABLE_PROFILE); G913 M-keys ship with this.
+    EnableProfile(u8),
     Disabled,
     Other([u8; 4]),
 }
@@ -137,6 +145,7 @@ impl Binding {
                 Ok([sector_high, sector_low, offset_high, offset_low])
             }
             Self::Special(code) => Ok([0x90, *code, 0, 0]),
+            Self::EnableProfile(profile) => Ok([0x90, 0x0D, 0xFF, *profile]),
             Self::Disabled => Ok([0xFF, 0, 0, 0]),
             Self::Other(raw) => Ok(*raw),
         }
@@ -162,7 +171,9 @@ impl Binding {
                 sector: u16::from_be_bytes([raw[0], raw[1]]),
                 offset: u16::from_be_bytes([raw[2], raw[3]]),
             },
-            (0x90, _) => Self::Special(raw[1]),
+            (0x90, 0x0D) if raw[2] == 0xFF => Self::EnableProfile(raw[3]),
+            // specials carry no operand; anything else must round-trip as raw bytes
+            (0x90, _) if raw[2] == 0 && raw[3] == 0 => Self::Special(raw[1]),
             (0xFF, _) => Self::Disabled,
             _ => Self::Other(raw),
         }
@@ -181,6 +192,7 @@ impl fmt::Display for Binding {
                 write!(f, "macro:0x{sector:04X}:0x{offset:04X}")
             }
             Self::Special(code) => write!(f, "{}", special_name(*code)),
+            Self::EnableProfile(profile) => write!(f, "enable-profile:{profile}"),
             Self::Disabled => write!(f, "disabled"),
             Self::Other(raw) => write!(
                 f,
@@ -447,7 +459,7 @@ impl<'a> Onboard<'a> {
             "sector length changed"
         );
         ensure!(
-            sector_crc_valid(expected_original),
+            sector_intact(expected_original),
             "current sector CRC is invalid; refusing to write"
         );
         ensure!(
@@ -513,8 +525,10 @@ impl<'a> Onboard<'a> {
         let mut sectors = vec![(0, directory)];
         for sector in 1..u16::from(description.sector_count) {
             let data = self.read_sector(sector, description.sector_size)?;
+            // Never-written sectors (factory 0xFF fill, e.g. unused macro sectors on a G913)
+            // carry no CRC; keep them as-is instead of rejecting the whole dump.
             ensure!(
-                sector_crc_valid(&data),
+                sector_intact(&data),
                 "sector 0x{sector:04X} has an invalid CRC"
             );
             sectors.push((sector, data));
@@ -524,6 +538,12 @@ impl<'a> Onboard<'a> {
             sectors,
         })
     }
+}
+
+/// A sector is acceptable in dumps/exports when its CRC verifies OR it was never written
+/// (factory 0xFF fill; unused macro sectors on a G913 look like this).
+pub fn sector_intact(data: &[u8]) -> bool {
+    data.iter().all(|byte| *byte == 0xFF) || sector_crc_valid(data)
 }
 
 pub fn parse_directory(data: &[u8], profile_count: u8) -> Result<Vec<DirectoryEntry>> {
@@ -902,8 +922,11 @@ pub fn parse_binding(value: &str) -> Result<Binding> {
             "middle" => 3,
             "back" => 4,
             "forward" => 5,
-            _ => bail!("unknown mouse button {name:?}"),
+            _ => name
+                .parse()
+                .with_context(|| format!("unknown mouse button {name:?}"))?,
         };
+        ensure!((1..=16).contains(&button), "mouse button must be 1..=16");
         return Ok(Binding::Mouse(button));
     }
     if let Some(combo) = lower.strip_prefix("key:") {
@@ -922,6 +945,20 @@ pub fn parse_binding(value: &str) -> Result<Binding> {
             sector: parse_u16(sector)?,
             offset: parse_u16(offset)?,
         });
+    }
+    if let Some(profile) = lower.strip_prefix("enable-profile:") {
+        return Ok(Binding::EnableProfile(
+            profile
+                .parse()
+                .context("enable-profile:<n> needs a number")?,
+        ));
+    }
+    if let Some(code) = lower.strip_prefix("special:") {
+        return Ok(Binding::Special(
+            parse_u16(code)?
+                .try_into()
+                .context("special binding code must fit one byte")?,
+        ));
     }
     if let Some(raw) = lower.strip_prefix("raw:") {
         let bytes = decode_hex(raw)?;
@@ -1366,6 +1403,7 @@ pub fn pack_macros(
     let mut sector_index = 0_usize;
     let mut offset = 0_usize;
     let mut locations = Vec::with_capacity(macros.len());
+    let mut last_used_sector = None;
 
     for (macro_index, value) in macros.iter().enumerate() {
         ensure!(offset & 1 == 0, "macro packer lost 2-byte record alignment");
@@ -1394,9 +1432,12 @@ pub fn pack_macros(
             &mut offset,
             macro_index + 1 < macros.len(),
         )?;
+        last_used_sector = Some(sector_index);
     }
-    for (_, sector) in &mut sectors {
-        update_sector_crc(sector)?;
+    if let Some(last) = last_used_sector {
+        for (_, sector) in &mut sectors[..=last] {
+            update_sector_crc(sector)?;
+        }
     }
     Ok((sectors, locations))
 }
@@ -1508,8 +1549,10 @@ pub fn decode_macro(
         let data = sectors
             .get(&sector)
             .with_context(|| format!("macro sector 0x{sector:04X} was not read"))?;
+        // A blank (never-written) sector reads as an immediate END: G HUB can leave bindings
+        // pointing at macro sectors it never filled (seen on a G913 G-Shift bank).
         ensure!(
-            sector_crc_valid(data),
+            sector_intact(data),
             "macro sector 0x{sector:04X} CRC is invalid"
         );
         let payload_end = data.len() - 2;
@@ -1643,51 +1686,16 @@ pub fn export_state(dump: &SectorDump, device_type: &str) -> Result<OnboardExpor
     let entries = parse_directory(directory_raw, dump.description.profile_count)?;
     let macro_ids = macro_sector_ids(&dump.description, &entries)?;
     let macro_id_set = macro_ids.iter().copied().collect::<BTreeSet<_>>();
-    let keyboard = device_type.eq_ignore_ascii_case("KEYBOARD");
-    let count = BUTTON_COUNT.min(usize::from(dump.description.button_count));
     let mut profiles = Vec::with_capacity(entries.len());
 
     for entry in &entries {
-        let sector = sectors
-            .get(&entry.sector)
-            .with_context(|| format!("profile sector 0x{:04X} was not read", entry.sector))?;
-        validate_profile_sector(sector)?;
-        let bindings = export_binding_bank(
-            sector,
-            BUTTONS_OFFSET,
-            count,
-            keyboard,
+        profiles.push(decode_export_profile(
+            &dump.description,
+            entry,
+            device_type.eq_ignore_ascii_case("KEYBOARD"),
             &sectors,
             &macro_id_set,
-        )?;
-        let gshift_bindings = export_binding_bank(
-            sector,
-            GSHIFT_BUTTONS_OFFSET,
-            count,
-            keyboard,
-            &sectors,
-            &macro_id_set,
-        )?;
-        profiles.push(ExportProfile {
-            index: entry.index,
-            sector: entry.sector,
-            enabled: entry.enabled,
-            name: profile_name(sector)?,
-            rate_hz: report_rate(sector)?,
-            dpi: if keyboard {
-                None
-            } else {
-                match dpi_table(sector) {
-                    Ok(table) => Some(table),
-                    Err(_) if !entry.enabled => None,
-                    Err(error) => return Err(error),
-                }
-            },
-            bindings,
-            gshift_bindings,
-            led_slots: led_slots(sector)?,
-            raw_sector_hex: encode_hex(sector),
-        });
+        )?);
     }
 
     Ok(OnboardExport {
@@ -1712,6 +1720,47 @@ pub fn export_state(dump: &SectorDump, device_type: &str) -> Result<OnboardExpor
                 })
             })
             .collect::<Result<Vec<_>>>()?,
+    })
+}
+
+fn decode_export_profile(
+    description: &Description,
+    entry: &DirectoryEntry,
+    keyboard: bool,
+    sectors: &BTreeMap<u16, Vec<u8>>,
+    macro_ids: &BTreeSet<u16>,
+) -> Result<ExportProfile> {
+    let sector = sectors
+        .get(&entry.sector)
+        .with_context(|| format!("profile sector 0x{:04X} was not read", entry.sector))?;
+    validate_profile_sector(sector)?;
+    let count = BUTTON_COUNT.min(usize::from(description.button_count));
+    Ok(ExportProfile {
+        index: entry.index,
+        sector: entry.sector,
+        enabled: entry.enabled,
+        name: profile_name(sector)?,
+        rate_hz: report_rate(sector)?,
+        dpi: if keyboard {
+            None
+        } else {
+            match dpi_table(sector) {
+                Ok(table) => Some(table),
+                Err(_) if !entry.enabled => None,
+                Err(error) => return Err(error),
+            }
+        },
+        bindings: export_binding_bank(sector, BUTTONS_OFFSET, count, keyboard, sectors, macro_ids)?,
+        gshift_bindings: export_binding_bank(
+            sector,
+            GSHIFT_BUTTONS_OFFSET,
+            count,
+            keyboard,
+            sectors,
+            macro_ids,
+        )?,
+        led_slots: led_slots(sector)?,
+        raw_sector_hex: encode_hex(sector),
     })
 }
 
@@ -1800,6 +1849,40 @@ pub fn repack_export_macros(export: &mut OnboardExport) -> Result<()> {
         bindings[binding_index].binding = binding.to_string();
         bindings[binding_index].raw_hex = encode_hex(&binding.encode()?);
     }
+    for profile in &mut export.profiles {
+        if profile.raw_sector_hex.is_empty() {
+            continue;
+        }
+        let mut sector = decode_hex(&profile.raw_sector_hex)?;
+        ensure!(
+            sector.len() == usize::from(export.description.sector_size),
+            "profile {} raw sector has the wrong size",
+            profile.index
+        );
+        let original = sector.clone();
+        for (base, bindings) in [
+            (BUTTONS_OFFSET, &profile.bindings),
+            (GSHIFT_BUTTONS_OFFSET, &profile.gshift_bindings),
+        ] {
+            for (index, binding) in bindings.iter().enumerate() {
+                let imported = parse_binding(&binding.binding)?;
+                ensure!(
+                    matches!(imported, Binding::Macro { .. }) == binding.r#macro.is_some(),
+                    "{} macro steps do not match its binding",
+                    binding.control
+                );
+                let offset = base + index * 4;
+                let raw = Binding::decode(sector[offset..offset + 4].try_into().unwrap());
+                if raw != imported {
+                    sector[offset..offset + 4].copy_from_slice(&imported.encode()?);
+                }
+            }
+        }
+        if sector != original {
+            update_sector_crc(&mut sector)?;
+            profile.raw_sector_hex = encode_hex(&sector);
+        }
+    }
     export.macro_sectors = sectors
         .into_iter()
         .map(|(sector, bytes)| RawSector {
@@ -1835,12 +1918,11 @@ pub fn import_plan(
     );
     let current_sectors = sector_map(current)?;
     let mut normalized = exported.clone();
-    if export_macros_need_repack(&normalized)? {
-        repack_export_macros(&mut normalized)?;
-    }
-    let mut desired = raw_export_sector_map(&normalized)?;
+    let raw = raw_export_sector_map(&normalized)?;
+    let mut desired = raw.clone();
+    patch_export_macros(&mut normalized, &raw, &mut desired)?;
     reencode_directory(&normalized, &mut desired)?;
-    reencode_profiles(&normalized, &mut desired)?;
+    reencode_profiles(&normalized, &raw, &mut desired)?;
     ensure!(
         desired.keys().eq(current_sectors.keys()),
         "export sector set does not match the target sector set"
@@ -1860,47 +1942,253 @@ pub fn import_plan(
         .collect::<Vec<_>>())
 }
 
-fn export_macros_need_repack(export: &OnboardExport) -> Result<bool> {
-    let desired = raw_export_sector_map(export)?;
-    let ids = macro_sector_ids(&export.description, &export.directory.entries)?
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    for profile in &export.profiles {
-        let raw = decode_hex(&profile.raw_sector_hex)?;
-        for (base, bindings) in [
-            (BUTTONS_OFFSET, &profile.bindings),
-            (GSHIFT_BUTTONS_OFFSET, &profile.gshift_bindings),
-        ] {
-            for (index, binding) in bindings.iter().enumerate() {
-                let raw_binding = Binding::decode(
-                    raw[base + index * 4..base + index * 4 + 4]
-                        .try_into()
-                        .unwrap(),
-                );
-                let imported = parse_binding(&binding.binding)?;
-                if matches!(raw_binding, Binding::Macro { .. })
-                    != matches!(imported, Binding::Macro { .. })
-                {
-                    return Ok(true);
-                }
-                if let Binding::Macro { sector, offset } = imported {
-                    let Some(expected) = &binding.r#macro else {
-                        bail!(
-                            "{} has a macro binding without decoded steps",
-                            binding.control
-                        );
-                    };
-                    match decode_macro(&desired, &ids, sector, offset) {
-                        Ok(actual) if actual == *expected => {}
-                        _ => return Ok(true),
+fn patch_export_macros(
+    export: &mut OnboardExport,
+    raw: &BTreeMap<u16, Vec<u8>>,
+    desired: &mut BTreeMap<u16, Vec<u8>>,
+) -> Result<()> {
+    let macro_ids = macro_sector_ids(&export.description, &export.directory.entries)?;
+    let macro_id_set = macro_ids.iter().copied().collect::<BTreeSet<_>>();
+    let mut pending = Vec::new();
+    let mut protected = BTreeSet::new();
+
+    for (profile_index, profile) in export.profiles.iter().enumerate() {
+        for (gshift, bindings) in [(false, &profile.bindings), (true, &profile.gshift_bindings)] {
+            for (binding_index, binding) in bindings.iter().enumerate() {
+                match parse_binding(&binding.binding)? {
+                    Binding::Macro { sector, offset } => {
+                        let expected = binding.r#macro.as_ref().with_context(|| {
+                            format!(
+                                "profile {} {}{} has a macro binding without decoded steps",
+                                profile.index,
+                                if gshift { "G-Shift " } else { "" },
+                                binding.control
+                            )
+                        })?;
+                        match decode_macro(raw, &macro_id_set, sector, offset) {
+                            Ok(actual) if actual == *expected => {
+                                protected.extend(macro_storage_sectors(
+                                    raw,
+                                    &macro_id_set,
+                                    sector,
+                                    offset,
+                                )?);
+                            }
+                            _ => pending.push((
+                                profile_index,
+                                gshift,
+                                binding_index,
+                                expected.clone(),
+                            )),
+                        }
                     }
-                } else if binding.r#macro.is_some() {
-                    bail!("{} has macro steps but is not macro-bound", binding.control);
+                    _ => ensure!(
+                        binding.r#macro.is_none(),
+                        "{} has macro steps but is not macro-bound",
+                        binding.control
+                    ),
                 }
             }
         }
     }
-    Ok(false)
+
+    // Changed/new macros use unreferenced blank sectors first, leaving every existing
+    // unchanged macro (including an empty dangling reference) at its original address.
+    // If those blanks are insufficient, only that profile's macros are re-packed, and
+    // sectors referenced by other profiles are excluded from the fallback pack.
+    for profile_index in 0..export.profiles.len() {
+        let edits = pending
+            .iter()
+            .filter(|(index, _, _, _)| *index == profile_index)
+            .cloned()
+            .collect::<Vec<_>>();
+        if edits.is_empty() {
+            continue;
+        }
+        let available = macro_ids
+            .iter()
+            .copied()
+            .filter(|sector| {
+                !protected.contains(sector)
+                    && desired
+                        .get(sector)
+                        .map_or(false, |bytes| bytes.iter().all(|byte| *byte == 0xFF))
+            })
+            .collect::<Vec<_>>();
+        let values = edits
+            .iter()
+            .map(|(_, _, _, value)| value.clone())
+            .collect::<Vec<_>>();
+        if !available.is_empty()
+            && let Ok((packed, locations)) =
+                pack_macros(&values, &available, export.description.sector_size)
+        {
+            for (sector, bytes) in packed {
+                if !bytes.iter().all(|byte| *byte == 0xFF) {
+                    desired.insert(sector, bytes);
+                }
+            }
+            for ((_, gshift, binding_index, _), (sector, offset)) in
+                edits.into_iter().zip(locations)
+            {
+                set_export_macro_location(
+                    export,
+                    profile_index,
+                    gshift,
+                    binding_index,
+                    sector,
+                    offset,
+                )?;
+            }
+            continue;
+        }
+
+        let mut protected_by_other_profiles = BTreeSet::new();
+        for (other_index, profile) in export.profiles.iter().enumerate() {
+            if other_index == profile_index {
+                continue;
+            }
+            for bindings in [&profile.bindings, &profile.gshift_bindings] {
+                for binding in bindings {
+                    if let Binding::Macro { sector, offset } = parse_binding(&binding.binding)?
+                        && let Ok(sectors) =
+                            macro_storage_sectors(desired, &macro_id_set, sector, offset)
+                    {
+                        protected_by_other_profiles.extend(sectors);
+                    }
+                }
+            }
+        }
+        let candidates = macro_ids
+            .iter()
+            .copied()
+            .filter(|sector| !protected_by_other_profiles.contains(sector))
+            .collect::<Vec<_>>();
+        let mut all_targets = Vec::new();
+        let profile = &export.profiles[profile_index];
+        for (gshift, bindings) in [(false, &profile.bindings), (true, &profile.gshift_bindings)] {
+            for (binding_index, binding) in bindings.iter().enumerate() {
+                if matches!(parse_binding(&binding.binding)?, Binding::Macro { .. }) {
+                    all_targets.push((
+                        gshift,
+                        binding_index,
+                        binding.r#macro.clone().with_context(|| {
+                            format!(
+                                "{} has a macro binding without decoded steps",
+                                binding.control
+                            )
+                        })?,
+                    ));
+                }
+            }
+        }
+        let values = all_targets
+            .iter()
+            .map(|(_, _, value)| value.clone())
+            .collect::<Vec<_>>();
+        let (packed, locations) = pack_macros(&values, &candidates, export.description.sector_size)
+            .with_context(|| {
+                format!(
+                    "profile {} macros do not fit without moving another profile's macros",
+                    export.profiles[profile_index].index
+                )
+            })?;
+        for (sector, bytes) in packed {
+            if !bytes.iter().all(|byte| *byte == 0xFF) {
+                desired.insert(sector, bytes);
+            }
+        }
+        for ((gshift, binding_index, _), (sector, offset)) in all_targets.into_iter().zip(locations)
+        {
+            set_export_macro_location(
+                export,
+                profile_index,
+                gshift,
+                binding_index,
+                sector,
+                offset,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn set_export_macro_location(
+    export: &mut OnboardExport,
+    profile_index: usize,
+    gshift: bool,
+    binding_index: usize,
+    sector: u16,
+    offset: u16,
+) -> Result<()> {
+    let bindings = if gshift {
+        &mut export.profiles[profile_index].gshift_bindings
+    } else {
+        &mut export.profiles[profile_index].bindings
+    };
+    let binding = Binding::Macro { sector, offset };
+    bindings[binding_index].binding = binding.to_string();
+    bindings[binding_index].raw_hex = encode_hex(&binding.encode()?);
+    Ok(())
+}
+
+fn macro_storage_sectors(
+    sectors: &BTreeMap<u16, Vec<u8>>,
+    macro_ids: &BTreeSet<u16>,
+    start_sector: u16,
+    start_offset: u16,
+) -> Result<BTreeSet<u16>> {
+    ensure!(
+        macro_ids.contains(&start_sector),
+        "macro starts outside the explicit macro-sector range"
+    );
+    let mut sector = start_sector;
+    let mut offset = usize::from(start_offset);
+    let mut visited = BTreeSet::new();
+    let mut used = BTreeSet::new();
+    loop {
+        ensure!(
+            visited.insert((sector, offset)),
+            "macro bytecode contains a loop"
+        );
+        let data = sectors
+            .get(&sector)
+            .with_context(|| format!("macro sector 0x{sector:04X} was not read"))?;
+        ensure!(
+            sector_intact(data),
+            "macro sector 0x{sector:04X} CRC is invalid"
+        );
+        let payload_end = data.len() - 2;
+        ensure!(
+            offset < payload_end,
+            "macro offset is outside sector payload"
+        );
+        used.insert(sector);
+        match data[offset] {
+            0x01 => offset += 1,
+            0x40 | 0x43..=0x46 => {
+                ensure!(offset + 3 <= payload_end, "truncated macro event");
+                offset += 3;
+            }
+            0x60 => {
+                ensure!(offset + 5 <= payload_end, "truncated macro JUMP event");
+                ensure!(
+                    data[offset + 3..offset + 5] == [0, 0],
+                    "macro JUMP padding is not 0x0000"
+                );
+                let next = u16::from_be_bytes([data[offset + 1], data[offset + 2]]);
+                ensure!(
+                    macro_ids.contains(&next),
+                    "macro JUMP targets non-macro sector 0x{next:04X}"
+                );
+                sector = next;
+                offset = 0;
+            }
+            0xFF => break,
+            opcode => bail!("unsupported onboard macro opcode 0x{opcode:02X}"),
+        }
+    }
+    Ok(used)
 }
 
 fn raw_export_sector_map(export: &OnboardExport) -> Result<BTreeMap<u16, Vec<u8>>> {
@@ -1942,7 +2230,7 @@ fn insert_export_sector(
         "sector 0x{sector:04X} has the wrong size"
     );
     ensure!(
-        sector_crc_valid(&bytes),
+        sector_intact(&bytes),
         "sector 0x{sector:04X} CRC is invalid"
     );
     ensure!(
@@ -1958,33 +2246,54 @@ fn reencode_directory(export: &OnboardExport, sectors: &mut BTreeMap<u16, Vec<u8
         "export directory entry count is incorrect"
     );
     let directory = sectors.get_mut(&0).unwrap();
-    for (index, entry) in export.directory.entries.iter().enumerate() {
+    let raw_entries = parse_directory(directory, export.description.profile_count)?;
+    let original = directory.clone();
+    for (index, (entry, raw)) in export.directory.entries.iter().zip(raw_entries).enumerate() {
         ensure!(
             entry.index == index + 1
                 && (1..=u16::from(export.description.profile_count)).contains(&entry.sector),
             "export directory entry {} has an invalid index or sector",
             index + 1
         );
-        let offset = index * 4;
-        directory[offset..offset + 2].copy_from_slice(&entry.sector.to_be_bytes());
-        directory[offset + 2] = u8::from(entry.enabled);
-        directory[offset + 3] = 0;
+        if (entry.sector, entry.enabled) != (raw.sector, raw.enabled) {
+            let offset = index * 4;
+            directory[offset..offset + 2].copy_from_slice(&entry.sector.to_be_bytes());
+            directory[offset + 2] = u8::from(entry.enabled);
+            directory[offset + 3] = 0xFF;
+        }
     }
-    let terminator = export.directory.entries.len() * 4;
-    directory[terminator..terminator + 2].copy_from_slice(&[0xFF, 0xFF]);
-    update_sector_crc(directory)?;
+    if directory != &original {
+        update_sector_crc(directory)?;
+    }
     parse_directory(directory, export.description.profile_count)?;
     Ok(())
 }
 
-fn reencode_profiles(export: &OnboardExport, sectors: &mut BTreeMap<u16, Vec<u8>>) -> Result<()> {
+fn reencode_profiles(
+    export: &OnboardExport,
+    raw: &BTreeMap<u16, Vec<u8>>,
+    sectors: &mut BTreeMap<u16, Vec<u8>>,
+) -> Result<()> {
     let keyboard = export.device_type.eq_ignore_ascii_case("KEYBOARD");
     let count = BUTTON_COUNT.min(usize::from(export.description.button_count));
     ensure!(
         export.profiles.len() == export.directory.entries.len(),
         "export profile count does not match directory"
     );
-    for (profile, entry) in export.profiles.iter().zip(&export.directory.entries) {
+    let raw_entries = parse_directory(
+        raw.get(&0)
+            .context("onboard export has no raw directory sector")?,
+        export.description.profile_count,
+    )?;
+    let macro_ids = macro_sector_ids(&export.description, &export.directory.entries)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for (position, (profile, entry)) in export
+        .profiles
+        .iter()
+        .zip(&export.directory.entries)
+        .enumerate()
+    {
         ensure!(
             profile.index == entry.index
                 && profile.sector == entry.sector
@@ -1997,26 +2306,52 @@ fn reencode_profiles(export: &OnboardExport, sectors: &mut BTreeMap<u16, Vec<u8>
             "profile {} binding count does not match device button_count",
             profile.index
         );
+        let raw_entry = DirectoryEntry {
+            index: profile.index,
+            sector: profile.sector,
+            enabled: raw_entries[position].enabled,
+        };
+        let decoded =
+            decode_export_profile(&export.description, &raw_entry, keyboard, raw, &macro_ids)?;
         let sector = sectors.get_mut(&profile.sector).unwrap();
-        set_profile_name_optional(sector, profile.name.as_deref())?;
-        if let Some(rate) = profile.rate_hz {
-            set_rate(sector, rate, export.description.profile_format_id)?;
+        let original = sector.clone();
+        if profile.name != decoded.name {
+            set_profile_name_optional(sector, profile.name.as_deref())?;
         }
-        match (&profile.dpi, keyboard) {
-            (Some(table), false) => set_dpi_table(sector, table)?,
-            (None, true) => {}
-            (Some(_), true) => bail!("keyboard export must not contain a DPI table"),
-            (None, false) => {}
+        if profile.rate_hz != decoded.rate_hz {
+            if let Some(rate) = profile.rate_hz {
+                set_rate(sector, rate, export.description.profile_format_id)?;
+            } else {
+                sector[0] = 0;
+            }
+        }
+        match (&profile.dpi, &decoded.dpi, keyboard) {
+            (None, None, true) => {}
+            (None, Some(_), true) => unreachable!(),
+            (Some(_), _, true) => bail!("keyboard export must not contain a DPI table"),
+            (desired, current, false) if desired == current => {}
+            (Some(table), _, false) => set_dpi_table(sector, table)?,
+            (None, Some(_), false) => {
+                ensure!(
+                    !profile.enabled,
+                    "enabled mouse profile {} cannot omit its DPI table",
+                    profile.index
+                );
+                sector[1..13].fill(0xFF);
+            }
+            (None, None, false) => {}
         }
         apply_export_bindings(
             sector,
             &profile.bindings,
+            &decoded.bindings,
             false,
             export.description.button_count,
         )?;
         apply_export_bindings(
             sector,
             &profile.gshift_bindings,
+            &decoded.gshift_bindings,
             true,
             export.description.button_count,
         )?;
@@ -2025,19 +2360,30 @@ fn reencode_profiles(export: &OnboardExport, sectors: &mut BTreeMap<u16, Vec<u8>
             "profile {} must contain four LED slots",
             profile.index
         );
-        for (slot, led) in profile.led_slots.iter().enumerate() {
+        for (slot, (led, raw_led)) in profile.led_slots.iter().zip(&decoded.led_slots).enumerate() {
             ensure!(led.slot == slot, "LED slot indices must be 0..=3 in order");
             let raw = decode_hex(&led.raw_hex)?;
             ensure!(raw.len() == LED_SLOT_SIZE, "LED slot must contain 11 bytes");
+            let decoded_led = LedSlot {
+                slot,
+                effect: raw_effect_name(u16::from(raw[0])).to_owned(),
+                raw_id: raw[0],
+                parameters_hex: encode_hex(&raw[1..]),
+                raw_hex: encode_hex(&raw),
+            };
             ensure!(
-                raw[0] == led.raw_id && encode_hex(&raw[1..]) == led.parameters_hex,
+                decoded_led == *led,
                 "LED slot {} decoded fields do not match raw_hex",
                 led.slot
             );
-            let offset = LED_SLOTS_OFFSET + slot * LED_SLOT_SIZE;
-            sector[offset..offset + LED_SLOT_SIZE].copy_from_slice(&raw);
+            if led != raw_led {
+                let offset = LED_SLOTS_OFFSET + slot * LED_SLOT_SIZE;
+                sector[offset..offset + LED_SLOT_SIZE].copy_from_slice(&raw);
+            }
         }
-        update_sector_crc(sector)?;
+        if sector != &original {
+            update_sector_crc(sector)?;
+        }
     }
     Ok(())
 }
@@ -2045,26 +2391,27 @@ fn reencode_profiles(export: &OnboardExport, sectors: &mut BTreeMap<u16, Vec<u8>
 fn apply_export_bindings(
     sector: &mut [u8],
     bindings: &[ExportBinding],
+    raw_bindings: &[ExportBinding],
     gshift: bool,
     button_count: u8,
 ) -> Result<()> {
-    for (index, binding) in bindings.iter().enumerate() {
+    for (index, (binding, raw_binding)) in bindings.iter().zip(raw_bindings).enumerate() {
         ensure!(
-            binding.number == index + 1,
-            "binding numbers must be sequential starting at 1"
+            binding.number == index + 1
+                && binding.number == raw_binding.number
+                && binding.control == raw_binding.control,
+            "binding identity must match the raw profile"
         );
         let imported = parse_binding(&binding.binding)?;
-        let raw = decode_hex(&binding.raw_hex)?;
-        if raw.len() == 4 && Binding::decode(raw.as_slice().try_into().unwrap()) == imported {
-            let base = if gshift {
-                GSHIFT_BUTTONS_OFFSET
-            } else {
-                BUTTONS_OFFSET
-            };
-            let offset = base + index * 4;
-            sector[offset..offset + 4].copy_from_slice(&raw);
-            update_sector_crc(sector)?;
-        } else {
+        ensure!(
+            matches!(imported, Binding::Macro { .. }) == binding.r#macro.is_some(),
+            "{} macro steps do not match its binding",
+            binding.control
+        );
+        let raw = decode_hex(&raw_binding.raw_hex)?;
+        ensure!(raw.len() == 4, "binding raw_hex must contain four bytes");
+        let decoded = Binding::decode(raw.as_slice().try_into().unwrap());
+        if imported != decoded {
             set_button(sector, binding.number, gshift, &imported, button_count)?;
         }
     }
@@ -2088,10 +2435,7 @@ fn sector_map(dump: &SectorDump) -> Result<BTreeMap<u16, Vec<u8>>> {
             bytes.len() == usize::from(dump.description.sector_size),
             "sector 0x{sector:04X} has the wrong size"
         );
-        ensure!(
-            sector_crc_valid(bytes),
-            "sector 0x{sector:04X} CRC is invalid"
-        );
+        ensure!(sector_intact(bytes), "sector 0x{sector:04X} CRC is invalid");
     }
     Ok(sectors)
 }
@@ -2115,7 +2459,7 @@ pub fn encode_dump(dump: &SectorDump) -> Result<Vec<u8>> {
             "dump sector size mismatch"
         );
         ensure!(
-            sector_crc_valid(data),
+            sector_intact(data),
             "refusing to encode sector 0x{sector:04X} with invalid CRC"
         );
         output.extend_from_slice(&sector.to_be_bytes());
@@ -2149,7 +2493,7 @@ pub fn decode_dump(data: &[u8]) -> Result<SectorDump> {
         offset += 2;
         let bytes = data[offset..offset + usize::from(description.sector_size)].to_vec();
         ensure!(
-            sector_crc_valid(&bytes),
+            sector_intact(&bytes),
             "dump sector 0x{sector:04X} has an invalid CRC"
         );
         sectors.push((sector, bytes));
@@ -2226,6 +2570,7 @@ mod tests {
                 offset: 0x1234,
             },
             Binding::Special(7),
+            Binding::EnableProfile(3),
             Binding::Disabled,
         ] {
             assert_eq!(Binding::decode(binding.encode().unwrap()), binding);
@@ -2418,6 +2763,10 @@ mod tests {
         );
         assert_eq!(macro_binding.encode().unwrap(), [0x00, 0x2A, 0x12, 0x34]);
         assert_eq!(parse_binding("macro:0x2a:4660").unwrap(), macro_binding);
+        let enable_profile = Binding::decode([0x90, 0x0D, 0xFF, 3]);
+        assert_eq!(enable_profile, Binding::EnableProfile(3));
+        assert_eq!(enable_profile.to_string(), "enable-profile:3");
+        assert_eq!(parse_binding("enable-profile:3").unwrap(), enable_profile);
     }
 
     #[test]
@@ -2527,6 +2876,128 @@ mod tests {
         let decoded: OnboardExport = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded, exported);
         assert!(import_plan(&decoded, &dump, "KEYBOARD").unwrap().is_empty());
+    }
+
+    fn synthetic_three_profile_keyboard() -> SectorDump {
+        let raw = [1, 4, 1, 3, 3, 8, 8, 0, 0xFF, 0, 0, 0, 0, 0, 0, 0];
+        let description = Description::parse(raw).unwrap();
+        let mut directory = vec![0xFF; 255];
+        directory[..14].copy_from_slice(&[0, 1, 1, 0xA1, 0, 2, 1, 0xA2, 0, 3, 1, 0xA3, 0xFF, 0xFF]);
+        update_sector_crc(&mut directory).unwrap();
+        let mut sectors = vec![(0, directory)];
+
+        for profile_index in 1..=3 {
+            let mut profile = vec![0xFF; 255];
+            profile[0] = 1;
+            update_sector_crc(&mut profile).unwrap();
+            set_profile_name(&mut profile, &format!("Profile {profile_index}")).unwrap();
+            for number in 6..=8 {
+                set_button(
+                    &mut profile,
+                    number,
+                    false,
+                    &Binding::EnableProfile((number - 5) as u8),
+                    8,
+                )
+                .unwrap();
+            }
+            set_button(
+                &mut profile,
+                1,
+                true,
+                &Binding::Macro {
+                    sector: 4,
+                    offset: ((profile_index - 1) * 2) as u16,
+                },
+                8,
+            )
+            .unwrap();
+            if profile_index == 2 {
+                profile[LED_SLOTS_OFFSET..LED_SLOTS_OFFSET + LED_SLOT_SIZE]
+                    .copy_from_slice(&[3, 0, 0, 0, 0, 0, 8, 0x34, 0x64, 0, 0]);
+                profile[LED_SLOTS_OFFSET + LED_SLOT_SIZE..LED_SLOTS_OFFSET + 2 * LED_SLOT_SIZE]
+                    .copy_from_slice(&[4, 0, 0, 0, 0, 0, 0, 0x34, 1, 0x64, 8]);
+                update_sector_crc(&mut profile).unwrap();
+            }
+            sectors.push((profile_index as u16, profile));
+        }
+        sectors.extend((4..8).map(|sector| (sector, vec![0xFF; 255])));
+        SectorDump {
+            description,
+            sectors,
+        }
+    }
+
+    #[test]
+    fn raw_patch_round_trips_three_profiles_with_blank_dangling_macros() {
+        let dump = synthetic_three_profile_keyboard();
+        let exported = export_state(&dump, "KEYBOARD").unwrap();
+        let json = serde_json::to_string_pretty(&exported).unwrap();
+        let decoded: OnboardExport = serde_json::from_str(&json).unwrap();
+
+        assert!(decoded.profiles.iter().all(|profile| {
+            profile.bindings[5..8]
+                .iter()
+                .enumerate()
+                .all(|(index, binding)| binding.binding == format!("enable-profile:{}", index + 1))
+        }));
+        assert!(decoded.macro_sectors.iter().all(|sector| {
+            decode_hex(&sector.raw_hex)
+                .unwrap()
+                .iter()
+                .all(|byte| *byte == 0xFF)
+        }));
+        assert!(import_plan(&decoded, &dump, "KEYBOARD").unwrap().is_empty());
+    }
+
+    #[test]
+    fn raw_patch_changes_only_the_profile_with_an_edited_binding() {
+        let dump = synthetic_three_profile_keyboard();
+        let mut exported = export_state(&dump, "KEYBOARD").unwrap();
+        exported.profiles[1].bindings[0].binding = "key:f12".into();
+
+        let diffs = import_plan(&exported, &dump, "KEYBOARD").unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].sector, 2);
+        assert_eq!(
+            &diffs[0].replacement[BUTTONS_OFFSET..BUTTONS_OFFSET + 4],
+            &[0x80, 2, 0, 0x45]
+        );
+    }
+
+    #[test]
+    fn changed_macro_uses_a_free_sector_without_moving_dangling_references() {
+        let dump = synthetic_three_profile_keyboard();
+        let mut exported = export_state(&dump, "KEYBOARD").unwrap();
+        exported.profiles[0].gshift_bindings[0].r#macro = Some(Macro {
+            steps: vec![MacroStep::Key { key: "f5".into() }],
+        });
+
+        let diffs = import_plan(&exported, &dump, "KEYBOARD").unwrap();
+        assert_eq!(
+            diffs.iter().map(|diff| diff.sector).collect::<Vec<_>>(),
+            [1, 5]
+        );
+        assert_eq!(
+            &diffs[0].replacement[GSHIFT_BUTTONS_OFFSET..GSHIFT_BUTTONS_OFFSET + 4],
+            &[0, 5, 0, 0]
+        );
+        assert!(diffs.iter().all(|diff| diff.sector != 4));
+    }
+
+    #[test]
+    fn directory_patch_preserves_untouched_reserved_bytes() {
+        let dump = synthetic_three_profile_keyboard();
+        let mut exported = export_state(&dump, "KEYBOARD").unwrap();
+        exported.directory.entries[1].enabled = false;
+        exported.profiles[1].enabled = false;
+
+        let diffs = import_plan(&exported, &dump, "KEYBOARD").unwrap();
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].sector, 0);
+        assert_eq!(diffs[0].replacement[3], 0xA1);
+        assert_eq!(diffs[0].replacement[7], 0xFF);
+        assert_eq!(diffs[0].replacement[11], 0xA3);
     }
 
     #[test]

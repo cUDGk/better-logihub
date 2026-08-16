@@ -202,12 +202,19 @@ def per_key_map(metadata: list[dict[str, Any]]) -> dict[str, dict[str, str]] | N
     }
     if not usages:
         return None
+    # 0x8081 wire zone ids: verified on a G915/G913 (2026-08-16) to be the Solaar-style
+    # sequential table (A=1, zone = HID usage - 3), NOT the raw HID usage. All known per-key
+    # boards use the same 0x8081 v2 feature, so default every per-key map to "solaar";
+    # `--zone-scheme hidusage` remains available as an override.
     return {
+        "zone_scheme": "solaar",
+        **{
         str(usage): {
             "label": hid_usage_label(usage),
             "component": f"PERKEY_KEYBOARD_{usage:02x}",
         }
         for usage in sorted(usages)
+        },
     }
 
 

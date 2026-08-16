@@ -191,14 +191,15 @@ pub fn zones_from_usages<I>(usages: I, scheme: ZoneScheme) -> Result<Vec<u8>>
 where
     I: IntoIterator<Item = u8>,
 {
+    // Bulk fill/clear: usages outside the Solaar table (e.g. 0x87 international keys)
+    // are skipped rather than failing the whole frame; `perkey set` still errors per key.
     let mut zones = usages
         .into_iter()
-        .map(|usage| match scheme {
-            ZoneScheme::HidUsage => Ok(usage),
-            ZoneScheme::Solaar => solaar_zone(usage)
-                .with_context(|| format!("HID usage 0x{usage:02X} has no Solaar zone")),
+        .filter_map(|usage| match scheme {
+            ZoneScheme::HidUsage => Some(usage),
+            ZoneScheme::Solaar => solaar_zone(usage),
         })
-        .collect::<Result<Vec<_>>>()?;
+        .collect::<Vec<_>>();
     zones.sort_unstable();
     zones.dedup();
     Ok(zones)

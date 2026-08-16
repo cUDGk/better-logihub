@@ -109,6 +109,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -620,6 +621,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -1131,6 +1133,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -1819,6 +1822,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -3078,6 +3082,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -3822,6 +3827,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -4313,6 +4319,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -5038,6 +5045,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -5835,6 +5843,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -6343,6 +6352,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -7715,6 +7725,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -8161,6 +8172,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -8903,6 +8915,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -9238,6 +9251,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -9805,6 +9819,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -10345,6 +10360,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -10849,6 +10865,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -11292,6 +11309,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -11755,6 +11773,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -12244,6 +12263,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -13050,6 +13070,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -13578,6 +13599,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -14038,6 +14060,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -14474,6 +14497,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -15097,6 +15121,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"
@@ -15545,6 +15570,7 @@
       },
       "dpi_default": null,
       "per_key_map": {
+        "zone_scheme": "solaar",
         "4": {
           "label": "A",
           "component": "PERKEY_KEYBOARD_04"

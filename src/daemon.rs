@@ -97,6 +97,8 @@ pub fn watch(discovery: &Discovery, index: Option<usize>, json: bool) -> Result<
     while !SHUTDOWN_REQUESTED.load(Ordering::SeqCst) {
         if let Some(notification) = listener.next_event(Duration::from_millis(100))? {
             print_notification(&notification, json, false);
+            // stdout is block-buffered when piped; events must show up immediately
+            let _ = std::io::Write::flush(&mut std::io::stdout());
         }
         if Instant::now() >= next_refresh {
             for warning in listener.refresh_routes() {

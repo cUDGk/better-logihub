@@ -754,7 +754,7 @@ struct BrightnessResult {
     info: BrightnessInfo,
     raw: u16,
     percent: u8,
-    illumination: bool,
+    illumination: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -1622,7 +1622,8 @@ fn mr_set(discovery: &Discovery, index: Option<usize>, enabled: bool, json: bool
 fn keys_list(discovery: &Discovery, index: Option<usize>, json: bool) -> Result<()> {
     let target = single_device(discovery, index)?;
     let keys = SpecialKeys::new(&target.device)?;
-    let capabilities = keys.capabilities()?;
+    // getCapabilities (fn 4) only exists on newer 0x1B04 versions; older boards answer error 7.
+    let capabilities = keys.capabilities().unwrap_or(0);
     let rows = keys
         .all_cid_info()?
         .into_iter()
@@ -1869,7 +1870,12 @@ fn brightness_get(discovery: &Discovery, index: Option<usize>, json: bool) -> Re
         info,
         raw,
         percent: brightness_percent(info, raw),
-        illumination: brightness.illumination()?,
+        // fn 3/4 exist only when capabilities bit2 (on/off) is set; else the device answers error 7.
+        illumination: if info.capabilities & 0x04 != 0 {
+            Some(brightness.illumination()?)
+        } else {
+            None
+        },
     };
     if json {
         return print_json(&result);
@@ -1895,7 +1901,9 @@ fn brightness_get(discovery: &Discovery, index: Option<usize>, json: bool) -> Re
             result.info.max.to_string(),
             format!("{} (safe {})", result.info.steps, result.info.safe_steps),
             format!("0x{:02X}", result.info.capabilities),
-            result.illumination.to_string(),
+            result
+                .illumination
+                .map_or_else(|| "-".to_string(), |value| value.to_string()),
         ]],
     );
     Ok(())
@@ -2032,6 +2040,7 @@ fn apply_rgb_effect(
                         .join(", ")
                 )
             })?;
+        rgb.set_sw_control(true, true)?;
         rgb.set_effect(cluster.index, supported.index, params, persistence)?;
     }
     Ok(zones)
