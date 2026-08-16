@@ -1033,6 +1033,13 @@ pub fn install(start: bool) -> Result<DaemonStatus> {
     if start && !is_daemon_running()? {
         let mut command = Command::new(&executable);
         hide_child_console(&mut command);
+        // Start the resident daemon with a clean environment: `install --start` is often run
+        // from inside a tool/agent shell whose session markers must not outlive it.
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().to_ascii_uppercase().starts_with("CLAUDE") {
+                command.env_remove(&key);
+            }
+        }
         command
             .spawn()
             .with_context(|| format!("failed to start {}", executable.display()))?;

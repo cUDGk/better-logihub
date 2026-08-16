@@ -323,6 +323,13 @@ impl Action {
             Self::Run(action) => {
                 let mut command = Command::new("cmd.exe");
                 command.args(["/D", "/S", "/C"]);
+                // The daemon may have been started from inside another tool session (e.g. an
+                // agent's shell); don't let that session's markers leak into launched apps.
+                for (key, _) in std::env::vars_os() {
+                    if key.to_string_lossy().to_ascii_uppercase().starts_with("CLAUDE") {
+                        command.env_remove(&key);
+                    }
+                }
                 #[cfg(windows)]
                 {
                     use std::os::windows::process::CommandExt;
