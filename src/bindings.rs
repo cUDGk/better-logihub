@@ -9,6 +9,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
+use crate::lighting::rgb::RgbColor;
+use crate::live::RgbSetting;
 use crate::specialkeys::resolve_cid;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -22,6 +24,23 @@ pub struct DeviceBindings {
     #[serde(default)]
     pub gkeys: BTreeMap<String, Action>,
     #[serde(default)]
+    pub gkeys_shifted: BTreeMap<String, Action>,
+    #[serde(default)]
+    pub cids: BTreeMap<String, Action>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gshift_key: Option<String>,
+    #[serde(default)]
+    pub apps: BTreeMap<String, AppBindings>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AppBindings {
+    #[serde(default)]
+    pub gkeys: BTreeMap<String, Action>,
+    #[serde(default)]
+    pub gkeys_shifted: BTreeMap<String, Action>,
+    #[serde(default)]
     pub cids: BTreeMap<String, Action>,
 }
 
@@ -32,6 +51,12 @@ pub enum Action {
     Text(TextAction),
     Run(RunAction),
     Macro(MacroAction),
+    Dpi(DpiAction),
+    Profile(ProfileAction),
+    Media(MediaAction),
+    Rgb(RgbAction),
+    Brightness(BrightnessAction),
+    PerKeyFill(PerKeyFillAction),
     None(NoneAction),
 }
 
@@ -63,6 +88,56 @@ pub struct MacroAction {
 #[serde(deny_unknown_fields)]
 pub struct NoneAction {
     pub none: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DpiAction {
+    pub dpi: DpiValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DpiValue {
+    Named(String),
+    Value(u16),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileAction {
+    pub profile: ProfileValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ProfileValue {
+    Named(String),
+    Number(u16),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaAction {
+    pub media: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RgbAction {
+    pub rgb: RgbSetting,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrightnessAction {
+    pub brightness: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PerKeyFillAction {
+    pub perkey_fill: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,17 +224,41 @@ impl Bindings {
                 !device.trim().is_empty(),
                 "device selector must not be empty"
             );
-            for (gkey, action) in &bindings.gkeys {
-                parse_gkey(gkey)?;
-                action.validate()?;
+            validate_gkey_map(&bindings.gkeys)?;
+            validate_gkey_map(&bindings.gkeys_shifted)?;
+            validate_cid_map(&bindings.cids)?;
+            if let Some(gshift_key) = &bindings.gshift_key {
+                parse_gkey(gshift_key)?;
             }
-            for (cid, action) in &bindings.cids {
-                resolve_cid(cid)?;
-                action.validate()?;
+            for (exe, app) in &bindings.apps {
+                ensure!(!exe.trim().is_empty(), "application name must not be empty");
+                ensure!(
+                    *exe == exe.to_ascii_lowercase(),
+                    "application name {exe:?} must be lowercase"
+                );
+                validate_gkey_map(&app.gkeys)?;
+                validate_gkey_map(&app.gkeys_shifted)?;
+                validate_cid_map(&app.cids)?;
             }
         }
         Ok(())
     }
+}
+
+fn validate_gkey_map(map: &BTreeMap<String, Action>) -> Result<()> {
+    for (gkey, action) in map {
+        parse_gkey(gkey)?;
+        action.validate()?;
+    }
+    Ok(())
+}
+
+fn validate_cid_map(map: &BTreeMap<String, Action>) -> Result<()> {
+    for (cid, action) in map {
+        resolve_cid(cid)?;
+        action.validate()?;
+    }
+    Ok(())
 }
 
 impl Action {
@@ -181,6 +280,37 @@ impl Action {
                     }
                 }
             }
+            Self::Dpi(action) => match &action.dpi {
+                DpiValue::Named(name) => ensure!(
+                    matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "up" | "down" | "cycle" | "shift" | "default"
+                    ),
+                    "dpi action must be up, down, cycle, shift, default, or a value"
+                ),
+                DpiValue::Value(value) => {
+                    ensure!(*value > 0, "DPI value must be greater than zero")
+                }
+            },
+            Self::Profile(action) => match &action.profile {
+                ProfileValue::Named(name) => ensure!(
+                    matches!(name.to_ascii_lowercase().as_str(), "next" | "prev"),
+                    "profile action must be next, prev, or a profile number"
+                ),
+                ProfileValue::Number(number) => {
+                    ensure!(*number > 0, "profile number must be greater than zero")
+                }
+            },
+            Self::Media(action) => {
+                media_key(&action.media)?;
+            }
+            Self::Rgb(action) => action.rgb.validate()?,
+            Self::Brightness(action) => {
+                ensure!(action.brightness <= 100, "brightness must be 0..=100")
+            }
+            Self::PerKeyFill(action) => {
+                action.perkey_fill.parse::<RgbColor>()?;
+            }
             Self::None(action) => ensure!(action.none, "none must be true"),
         }
         Ok(())
@@ -191,8 +321,20 @@ impl Action {
             Self::Keys(action) => send_chord(&action.keys),
             Self::Text(action) => send_text(&action.text),
             Self::Run(action) => {
-                Command::new("cmd.exe")
-                    .args(["/D", "/S", "/C", &action.run])
+                let mut command = Command::new("cmd.exe");
+                command.args(["/D", "/S", "/C"]);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::process::CommandExt;
+                    use windows_sys::Win32::System::Threading::CREATE_NO_WINDOW;
+                    // std's arg quoting turns `"` into `\"`, which cmd does not understand
+                    // (it would try to run `\`); hand the command line over verbatim.
+                    command.raw_arg(&action.run);
+                    command.creation_flags(CREATE_NO_WINDOW);
+                }
+                #[cfg(not(windows))]
+                command.arg(&action.run);
+                command
                     .spawn()
                     .with_context(|| format!("failed to run {:?}", action.run))?;
                 Ok(())
@@ -209,6 +351,12 @@ impl Action {
                 }
                 Ok(())
             }
+            Self::Media(action) => send_chord(media_key(&action.media)?),
+            Self::Dpi(_)
+            | Self::Profile(_)
+            | Self::Rgb(_)
+            | Self::Brightness(_)
+            | Self::PerKeyFill(_) => anyhow::bail!("action requires a daemon device context"),
             Self::None(_) => Ok(()),
         }
     }
@@ -219,9 +367,51 @@ impl Action {
             Self::Text(action) => format!("text:{} chars", action.text.chars().count()),
             Self::Run(action) => format!("run:{}", action.run),
             Self::Macro(action) => format!("macro:{} steps", action.r#macro.len()),
+            Self::Dpi(action) => format!(
+                "dpi:{}",
+                match &action.dpi {
+                    DpiValue::Named(name) => name.clone(),
+                    DpiValue::Value(value) => value.to_string(),
+                }
+            ),
+            Self::Profile(action) => format!(
+                "profile:{}",
+                match &action.profile {
+                    ProfileValue::Named(name) => name.clone(),
+                    ProfileValue::Number(number) => number.to_string(),
+                }
+            ),
+            Self::Media(action) => format!("media:{}", action.media),
+            Self::Rgb(action) => format!("rgb:{}:{}", action.rgb.zone, action.rgb.effect),
+            Self::Brightness(action) => format!("brightness:{}", action.brightness),
+            Self::PerKeyFill(action) => format!("perkey_fill:{}", action.perkey_fill),
             Self::None(_) => "none".into(),
         }
     }
+
+    pub fn is_dpi_shift(&self) -> bool {
+        matches!(
+            self,
+            Self::Dpi(DpiAction {
+                dpi: DpiValue::Named(name)
+            }) if name.eq_ignore_ascii_case("shift")
+        )
+    }
+}
+
+fn media_key(value: &str) -> Result<&'static str> {
+    Ok(match value.to_ascii_lowercase().as_str() {
+        "play_pause" | "play-pause" => "media-play-pause",
+        "next" => "media-next",
+        "prev" | "previous" => "media-prev",
+        "stop" => "media-stop",
+        "mute" => "volume-mute",
+        "vol_up" | "volume_up" | "volume-up" => "volume-up",
+        "vol_down" | "volume_down" | "volume-down" => "volume-down",
+        _ => anyhow::bail!(
+            "media action must be play_pause, next, prev, stop, mute, vol_up, or vol_down"
+        ),
+    })
 }
 
 pub fn parse_gkey(value: &str) -> Result<u8> {
@@ -457,5 +647,43 @@ mod tests {
         )
         .unwrap();
         assert!(bindings.validate().is_err());
+    }
+
+    #[test]
+    fn parses_every_resident_action_and_overlay_field() {
+        let json = r#"{
+          "devices": {
+            "g915": {
+              "gshift_key": "g5",
+              "gkeys": {
+                "g1": {"dpi":"up"},
+                "g2": {"dpi":3200},
+                "g3": {"profile":"next"},
+                "g4": {"profile":2},
+                "g5": {"media":"play_pause"}
+              },
+              "gkeys_shifted": {
+                "g1": {"rgb":{"zone":"all","effect":"fixed","color":"112233","persist":"ram"}},
+                "g2": {"brightness":0},
+                "g3": {"perkey_fill":"000000"}
+              },
+              "cids": {"dpi-up":{"media":"vol_up"}},
+              "apps": {
+                "game.exe": {
+                  "gkeys": {"g1":{"dpi":"shift"}},
+                  "gkeys_shifted": {"g2":{"media":"next"}},
+                  "cids": {"dpi-down":{"dpi":"cycle"}}
+                }
+              }
+            }
+          }
+        }"#;
+        let bindings: Bindings = serde_json::from_str(json).unwrap();
+        bindings.validate().unwrap();
+        let device = &bindings.devices["g915"];
+        assert_eq!(device.gshift_key.as_deref(), Some("g5"));
+        assert_eq!(device.apps["game.exe"].gkeys.len(), 1);
+        assert!(matches!(device.gkeys["g2"], Action::Dpi(_)));
+        assert!(matches!(device.gkeys_shifted["g1"], Action::Rgb(_)));
     }
 }

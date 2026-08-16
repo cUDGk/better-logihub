@@ -38,6 +38,8 @@ G HUB の設定データベースからプロファイル (DPI テーブル・�
 | 特殊キー一覧・divert・remap | `logihub keys list` / `keys divert ...` | 0x1B04 |
 | HID++ 入力イベント監視 | `logihub watch --device 3` | 0x8010 / 0x8020 / 0x8030 / 0x1B04 |
 | G キー・特殊キー常駐割り当て | `logihub daemon` | HID++ 通知 + Windows SendInput |
+| ウィンドウなし常駐・自動起動管理 | `logihub daemon install/status/uninstall` | `logihubd.exe` + HKCU\Run(ログオン時起動) |
+| 起動時照明・software mode | `logihub startup show/apply/init` | 0x8040 / 0x8071 / 0x8081 / 0x8010 |
 | G HUB 設定の完全移行 | `logihub profile import-ghub` | settings.db (SQLite + JSON) |
 | プロファイル表示・適用 | `logihub profile show` / `profile apply Desktop` | DPI / rate / 0x8071 / 0x8100 |
 | オンボードボタン / G キー割り当て | `logihub onboard set-button` / `set-gkey` | 0x8100 |
@@ -72,7 +74,8 @@ flowchart LR
 
 ```bash
 cargo build --release
-# → target/release/logihub.exe (単体バイナリ、コピーするだけで動く)
+# → target/release/logihub.exe と logihubd.exe
+# 自動起動を使う場合は 2 ファイルを同じディレクトリに置く
 ```
 
 ## 使い方
@@ -245,50 +248,115 @@ G HUB 組み込みカード ID は DB 内に実体がなくても復号します
 
 ## 常駐割り当て
 
-`logihub daemon` は `%APPDATA%\better-logihub\bindings.json` を読みます。ファイルがなければ安全な例を作成して終了するので、編集後にもう一度起動してください。`--config <path>` で別のファイルも指定できます。
+`logihub daemon` とウィンドウなしの `logihubd.exe` は同じ daemon 実装を使い、既定で `%APPDATA%\better-logihub\bindings.json` を読みます。ファイルがなければ安全な例を作成し、`startup.json` もなければ終了します。`logihubd.exe` はコンソールを開かず、ログを `%APPDATA%\better-logihub\logs\daemon.log` に追記します。約 5 MB で `daemon.log.1` へローテーションします。
+
+自動起動は現在のユーザーの `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` に登録します(管理者権限不要。タスク スケジューラの ONLOGON は管理者が要るため不採用)。対話ユーザーのデスクトップで動くため `SendInput` も利用できます。`install` は実行中の `logihub.exe` と同じディレクトリにある `logihubd.exe` の絶対パスを保存し、`--start` を付けるとその場で起動します。
+
+```bash
+logihub daemon install
+logihub daemon install --start
+logihub daemon status
+logihub daemon uninstall
+
+# コンソール上でのテスト実行
+logihub daemon --config C:\path\bindings.json --verbose
+
+# resident binary の手動テスト。通常は Run エントリから引数なしで起動する
+logihubd --config C:\path\bindings.json --verbose
+```
+
+`status` は Run エントリの有無、resident daemon の実行状態、実行ファイル、使用中の設定パス、ログパスを表示します。同名 mutex `Local\better-logihub-daemon` により二重起動は静かに終了します。`uninstall` は Run エントリを削除して named event で daemon に正常終了を要求し、G-key software mode、未解放の一時 DPI shift、daemon が divert した CID を復元します。ログオフ/シャットダウンの `WM_ENDSESSION` とコンソール終了通知でも同じ復元経路を通ります。
+
+### bindings.json
+
+デバイスキーは内蔵データの `model_id` または `0x` 付き PID です。CID は `keys list` に出る数値または名前を指定します。従来の `keys` / `text` / `run` / `macro` / `none` に加え、DPI、オンボードプロファイル、メディア、照明を押下 edge で実行できます。`{"dpi":"shift"}` だけは hold 中の一時 DPI で、release edge に元の DPI へ戻ります。
 
 ```json
 {
   "devices": {
     "g915": {
+      "gshift_key": "g5",
       "gkeys": {
         "g1": { "keys": "ctrl+shift+c" },
-        "g2": { "text": "定型文" },
-        "g3": { "run": "C:\\Tools\\app.exe --flag" },
-        "g4": {
-          "macro": [
-            { "keys": "ctrl+l" },
-            { "delay_ms": 50 },
-            { "text": "https://example.com" },
-            { "keys": "enter" }
-          ]
-        },
-        "g5": { "none": true }
+        "g2": { "media": "play_pause" },
+        "g3": { "brightness": 0 },
+        "g4": { "rgb": { "zone": "all", "effect": "fixed", "color": "004080", "persist": "ram" } }
+      },
+      "gkeys_shifted": {
+        "g1": { "text": "定型文" },
+        "g2": { "perkey_fill": "000000" }
       },
       "cids": {
         "play-pause": { "keys": "media-play-pause" }
-      }
-    },
-    "0x409f": {
-      "gkeys": {},
-      "cids": {
-        "gesture-navigation": { "keys": "win+tab" }
+      },
+      "apps": {
+        "game.exe": {
+          "gkeys": {
+            "g1": { "profile": "next" },
+            "g2": { "dpi": "shift" }
+          },
+          "gkeys_shifted": {
+            "g1": { "dpi": 3200 }
+          },
+          "cids": {
+            "play-pause": { "media": "mute" }
+          }
+        }
       }
     }
   }
 }
 ```
 
-デバイスキーは内蔵データの `model_id` または `0x` 付き PID です。CID は `keys list` に出る数値または名前を指定します。`keys` は `ctrl` / `shift` / `alt` / `win`、英数字、F1〜F24、Enter、Esc、Tab、Space、矢印、再生・曲送り・音量系メディアキーに対応します。`run` は `cmd.exe /D /S /C` で起動します。
+追加 action の値は次のとおりです。
 
-入力は held mask の変化から判定し、押下 edge で一度だけ action を実行、release edge は状態だけ更新します。キーリピートは行いません。Ctrl+C、Ctrl+Break、コンソール close/logoff/shutdown 時には G-key software mode を off、daemon が divert した CID を non-persistent な通常入力へ戻します。0x1D4B の再構成/電源投入通知では割り当てを再適用します。
+- `dpi`: `up` / `down` / `cycle` / `shift` / `default` または DPI 数値
+- `profile`: `next` / `prev` または 1 始まりのオンボードプロファイル番号
+- `media`: `play_pause` / `next` / `prev` / `stop` / `mute` / `vol_up` / `vol_down`
+- `rgb`: 後述の startup `rgb` と同じ object
+- `brightness`: 0〜100
+- `perkey_fill`: `RRGGBB`
+
+`gshift_key` を押している間は `gkeys` の代わりに `gkeys_shifted` を参照します。`apps` は前景ウィンドウの実行ファイル名を約 250 ms ごとに調べ、小文字の exe 名に一致した `gkeys` / `gkeys_shifted` / `cids` だけを base map の上へ重ねます。`--verbose` ではアプリ切り替えも記録します。
+
+### startup.json
+
+`%APPDATA%\better-logihub\startup.json` があれば daemon 起動時とデバイス再接続時に再適用します。`init` は RAM persistence だけを使う例を、既存ファイルを上書きせず作成します。`apply` は daemon を起動せず一度だけ適用する実機テスト用です。
 
 ```bash
-logihub daemon
-logihub daemon --config C:\path\bindings.json --verbose
+logihub startup init
+logihub startup show
+logihub startup apply --device 3
 ```
 
-`watch --json` はイベントごとに 1 JSON object を1行で出力します。daemon の `--verbose` は decoded event に加えて raw HID++ frame を stdout に記録します。
+```json
+{
+  "devices": {
+    "g915": {
+      "brightness": 20,
+      "rgb": [
+        {
+          "zone": "all",
+          "effect": "fixed",
+          "color": "004080",
+          "period_ms": 3000,
+          "speed": 20,
+          "brightness": 80,
+          "direction": "horizontal",
+          "persist": "ram"
+        }
+      ],
+      "perkey_fill": "001020",
+      "perkey": { "esc": "FF2000" },
+      "gkeys_software_mode": false
+    }
+  }
+}
+```
+
+`zone` は index または `all`、`persist` は `ram` / `nvm` / `powersave` です。`perkey` と `perkey_fill` は機種データの zone scheme を使います。常用設定で不揮発書き込みが不要なら `ram` のままにしてください。
+
+入力は held mask の変化から判定し、通常 action は押下 edge で一度だけ実行します。キーリピートは行いません。0x1D4B の再構成/電源投入通知では割り当てと startup 設定を再適用します。`watch --json` はイベントごとに 1 JSON object を 1 行で出力します。`logihub daemon --verbose` は stdout、`logihubd --verbose` は `daemon.log` に raw HID++ frame を追加します。
 
 ## 制限事項
 
@@ -301,8 +369,8 @@ logihub daemon --config C:\path\bindings.json --verbose
 - `onboard import` は書き込み前に sector 単位の差分を必ず表示します。`--dry-run` は一切書かず、実書き込みには `--yes` が必須です
 - 電源オフ / スリープ中の無線デバイスは `unreachable` と表示されます (レシーバーの仕様)
 - `gkeys info` の physical layout は仕様上「layout id」か「物理 G-key bitmask」か未確定のため、解釈せず raw BE16 として表示します
-- `bindings.json` は標準の press/release edge と単純 macro step を扱う軽量モデルです。G-Shift、M1〜M3、FN ごとの別 assignment map、hold/double-click/toggle/repeat macro は未実装です
-- daemon の復元処理は通常の Ctrl+C/console 終了通知で動きます。タスクマネージャーの「プロセスの終了」や電源断のようにプロセスへ猶予を与えない強制終了は捕捉できません
+- `bindings.json` は標準の press/release edge、単純 macro step、G-Shift 1 層を扱う軽量モデルです。M1〜M3、FN ごとの別 assignment map、hold/double-click/toggle/repeat macro は未実装です
+- daemon の復元処理は Ctrl+C/console 終了通知、resident の stop event、Windows の logoff/shutdown 通知で動きます。タスクマネージャーの「プロセスの終了」や電源断のようにプロセスへ猶予を与えない強制終了は捕捉できません
 
 ## 参考
 

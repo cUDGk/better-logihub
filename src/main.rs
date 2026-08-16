@@ -1,24 +1,13 @@
-mod bindings;
-mod daemon;
-mod device_data;
-mod discovery;
-mod ghub_import;
-mod gkeys;
-mod hidpp;
-mod lighting;
-mod listener;
-mod mkeys;
-mod onboard;
-mod output;
-mod profile;
-mod specialkeys;
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail, ensure};
+use better_logihub::{
+    daemon, device_data, discovery, ghub_import, gkeys, hidpp, lighting, live, mkeys, onboard,
+    output, profile, specialkeys, startup,
+};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 
@@ -29,17 +18,12 @@ use ghub_import::{
 };
 use gkeys::GKeys;
 use hidpp::device::{BatteryStatus, FeatureInfo};
-use lighting::brightness::{
-    Brightness, BrightnessInfo, percent_from_raw as brightness_percent,
-    raw_from_percent as brightness_raw,
-};
-use lighting::perkey::{
-    PerKeyLightingV2, ResolvedKey, ZoneScheme, probe_zones, resolve_key, zones_from_usages,
-};
+use lighting::brightness::{Brightness, BrightnessInfo, percent_from_raw as brightness_percent};
+use lighting::perkey::{PerKeyLightingV2, ResolvedKey, ZoneScheme, probe_zones};
 use lighting::rgb::{
-    Effect, EffectOptions, Persistence, RgbCapabilities, RgbColor, RgbEffects, encode_effect,
-    parse_direction,
+    Effect, EffectOptions, Persistence, RgbCapabilities, RgbColor, RgbEffects, parse_direction,
 };
+use live::{RgbPersistence, RgbSetting, RgbZone, apply_rgb_effect};
 use onboard::{
     Binding as OnboardBinding, ButtonRow, Description as OnboardDescription, DirectoryEntry, Macro,
     Onboard, SectorDiff, VerificationMethod, backup_path, button_rows, decode_macro, encode_dump,
@@ -160,11 +144,42 @@ enum Command {
     },
     /// Run configured G-key and special-key bindings until stopped.
     Daemon {
+        #[command(subcommand)]
+        command: Option<DaemonCommand>,
         #[arg(long)]
         config: Option<PathBuf>,
         #[arg(long)]
         verbose: bool,
     },
+    /// Show, apply, or initialize startup lighting and device settings.
+    Startup {
+        #[command(subcommand)]
+        command: StartupCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonCommand {
+    /// Register the per-user logon task.
+    Install {
+        /// Start logihubd immediately after registration.
+        #[arg(long)]
+        start: bool,
+    },
+    /// Delete the logon task and stop the resident daemon.
+    Uninstall,
+    /// Show task, process, config, and log status.
+    Status,
+}
+
+#[derive(Debug, Subcommand)]
+enum StartupCommand {
+    Show,
+    Apply {
+        #[arg(long)]
+        device: Option<usize>,
+    },
+    Init,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1163,7 +1178,21 @@ fn main() -> Result<()> {
             let discovery = discover_with_warnings()?;
             daemon::watch(&discovery, device, cli.json)
         }
-        Command::Daemon { config, verbose } => daemon::run(config, verbose, cli.json),
+        Command::Daemon {
+            command,
+            config,
+            verbose,
+        } => match command {
+            None => daemon::run(config, verbose, cli.json),
+            Some(DaemonCommand::Install { start }) => daemon_install(start, cli.json),
+            Some(DaemonCommand::Uninstall) => daemon_uninstall(cli.json),
+            Some(DaemonCommand::Status) => daemon_status(cli.json),
+        },
+        Command::Startup { command } => match command {
+            StartupCommand::Show => startup_show(cli.json),
+            StartupCommand::Apply { device } => startup_apply(device, cli.json),
+            StartupCommand::Init => startup_init(cli.json),
+        },
     }
 }
 
@@ -1173,6 +1202,102 @@ fn discover_with_warnings() -> Result<Discovery> {
         eprintln!("warning: {warning}");
     }
     Ok(discovery)
+}
+
+fn daemon_install(start: bool, json: bool) -> Result<()> {
+    print_daemon_status(&daemon::install(start)?, "installed", json)
+}
+
+fn daemon_uninstall(json: bool) -> Result<()> {
+    print_daemon_status(&daemon::uninstall()?, "uninstalled", json)
+}
+
+fn daemon_status(json: bool) -> Result<()> {
+    print_daemon_status(&daemon::status()?, "status", json)
+}
+
+fn print_daemon_status(result: &daemon::DaemonStatus, operation: &str, json: bool) -> Result<()> {
+    if json {
+        return print_json(&serde_json::json!({
+            "operation": operation,
+            "task": result.task_name,
+            "task_installed": result.task_installed,
+            "daemon_running": result.daemon_running,
+            "executable": result.executable,
+            "config": result.config,
+            "log": result.log,
+        }));
+    }
+    print_table(
+        &[
+            "TASK",
+            "INSTALLED",
+            "RUNNING",
+            "EXECUTABLE",
+            "CONFIG",
+            "LOG",
+        ],
+        &[vec![
+            result.task_name.clone(),
+            result.task_installed.to_string(),
+            result.daemon_running.to_string(),
+            result
+                .executable
+                .as_ref()
+                .map_or_else(|| "-".into(), |path| path.display().to_string()),
+            result.config.display().to_string(),
+            result.log.display().to_string(),
+        ]],
+    );
+    Ok(())
+}
+
+fn startup_show(json: bool) -> Result<()> {
+    let path = startup::default_path()?;
+    let value = startup::load(&path)?;
+    if json {
+        return print_json(&value);
+    }
+    println!("{}", path.display());
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+fn startup_init(json: bool) -> Result<()> {
+    let path = startup::default_path()?;
+    let created = startup::init(&path)?;
+    if json {
+        return print_json(&serde_json::json!({"path": path, "created": created}));
+    }
+    println!(
+        "{} {}",
+        if created { "created" } else { "already exists" },
+        path.display()
+    );
+    Ok(())
+}
+
+fn startup_apply(index: Option<usize>, json: bool) -> Result<()> {
+    let path = startup::default_path()?;
+    let value = startup::load(&path)?;
+    startup::require_nonempty(&value)?;
+    let results = startup::apply(&discover_with_warnings()?, index, &value)?;
+    if json {
+        return print_json(&results);
+    }
+    let rows = results
+        .iter()
+        .map(|result| {
+            vec![
+                result.device.to_string(),
+                result.name.clone(),
+                result.selector.clone(),
+                result.applied.join(", "),
+            ]
+        })
+        .collect::<Vec<_>>();
+    print_table(&["DEVICE", "NAME", "SELECTOR", "APPLIED"], &rows);
+    Ok(())
 }
 
 fn list(discovery: &Discovery, json: bool) -> Result<()> {
@@ -1917,10 +2042,22 @@ fn brightness_set(
     json: bool,
 ) -> Result<()> {
     let target = single_device(discovery, index)?;
-    let brightness = Brightness::new(&target.device)?;
-    let info = brightness.info()?;
-    let requested_raw = if value.eq_ignore_ascii_case("raw") {
-        raw_value.context("brightness set raw requires a raw level")?
+    let (requested_raw, effective_raw, percent) = if value.eq_ignore_ascii_case("raw") {
+        let brightness = Brightness::new(&target.device)?;
+        let info = brightness.info()?;
+        let requested_raw = raw_value.context("brightness set raw requires a raw level")?;
+        ensure!(
+            (info.min..=info.max).contains(&requested_raw),
+            "raw brightness must be in the device range {}..={} ",
+            info.min,
+            info.max
+        );
+        let effective_raw = brightness.set_brightness(requested_raw)?;
+        (
+            requested_raw,
+            effective_raw,
+            brightness_percent(info, effective_raw),
+        )
     } else {
         ensure!(
             raw_value.is_none(),
@@ -1929,21 +2066,19 @@ fn brightness_set(
         let percent = value
             .parse::<u8>()
             .with_context(|| format!("invalid brightness percentage {value:?}"))?;
-        brightness_raw(info, percent)?
+        let applied = live::set_brightness_percent(target, percent)?;
+        (
+            applied.requested_raw,
+            applied.effective_raw,
+            applied.percent,
+        )
     };
-    ensure!(
-        (info.min..=info.max).contains(&requested_raw),
-        "raw brightness must be in the device range {}..={} ",
-        info.min,
-        info.max
-    );
-    let effective_raw = brightness.set_brightness(requested_raw)?;
     let result = BrightnessSetResult {
         device: target.index,
         name: target.name.clone(),
         requested_raw,
         effective_raw,
-        percent: brightness_percent(info, effective_raw),
+        percent,
         status: "set and read back".into(),
     };
     if json {
@@ -1988,17 +2123,20 @@ fn rgb_set(
     json: bool,
 ) -> Result<()> {
     let target = single_device(discovery, index)?;
-    let effect = Effect::parse(effect_name)?;
-    let options = EffectOptions {
-        color: color.map(str::parse).transpose()?,
-        color2: color2.map(str::parse).transpose()?,
+    let setting = RgbSetting {
+        zone: RgbZone::Name(zone.into()),
+        effect: effect_name.into(),
+        color: color.map(str::to_owned),
+        color2: color2.map(str::to_owned),
         speed,
         period_ms: period,
         brightness,
         intensity,
-        direction: direction.map(parse_direction).transpose()?,
+        direction: direction.map(str::to_owned),
+        persist: RgbPersistence::from(persistence),
     };
-    let zones = apply_rgb_effect(target, zone, effect, &options, persistence)?;
+    let zones = live::apply_rgb_setting(target, &setting)?;
+    let effect = Effect::parse(effect_name)?;
     let result = RgbWriteResult {
         device: target.index,
         name: target.name.clone(),
@@ -2008,42 +2146,6 @@ fn rgb_set(
         status: "set".into(),
     };
     print_rgb_write(result, json)
-}
-
-fn apply_rgb_effect(
-    target: &ManagedDevice,
-    zone: &str,
-    effect: Effect,
-    options: &EffectOptions,
-    persistence: Persistence,
-) -> Result<Vec<u8>> {
-    let rgb = RgbEffects::new(&target.device)?;
-    let capabilities = rgb.capabilities()?;
-    let zones = select_rgb_zones(&capabilities, zone)?;
-    let params = encode_effect(effect, options)?;
-    for cluster_index in &zones {
-        let cluster = &capabilities.clusters[usize::from(*cluster_index)];
-        let supported = cluster
-            .effects
-            .iter()
-            .find(|candidate| candidate.id == effect.raw_id)
-            .with_context(|| {
-                format!(
-                    "zone {} does not support effect {} (supported: {})",
-                    cluster.index,
-                    effect.name,
-                    cluster
-                        .effects
-                        .iter()
-                        .map(|effect| effect.name.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })?;
-        rgb.set_sw_control(true, true)?;
-        rgb.set_effect(cluster.index, supported.index, params, persistence)?;
-    }
-    Ok(zones)
 }
 
 fn rgb_info(discovery: &Discovery, index: Option<usize>, json: bool) -> Result<()> {
@@ -2219,26 +2321,20 @@ fn perkey_set(
     json: bool,
 ) -> Result<()> {
     let target = single_device(discovery, index)?;
-    let scheme = perkey_scheme(target, scheme)?;
-    let mut keys = Vec::with_capacity(assignments.len());
-    let mut colors = Vec::with_capacity(assignments.len());
+    let mut parsed = Vec::with_capacity(assignments.len());
     for assignment in assignments {
         let (key, color) = assignment
             .split_once('=')
             .with_context(|| format!("assignment {assignment:?} must be <key>=RRGGBB"))?;
-        let resolved = resolve_key(key, scheme)?;
-        validate_model_key(target, &resolved)?;
-        colors.push((resolved.zone_id, color.parse::<RgbColor>()?));
-        keys.push(resolved);
+        parsed.push((key.to_owned(), color.to_owned()));
     }
-    prepare_perkey(target)?;
-    let requests = PerKeyLightingV2::new(&target.device)?.write_colors(&colors, persistent)?;
+    let applied = live::apply_perkey_pairs(target, scheme, &parsed, persistent)?;
     print_perkey_result(
         target,
-        scheme,
-        keys,
-        colors.len(),
-        requests,
+        applied.scheme,
+        applied.keys,
+        applied.zone_count,
+        applied.requests,
         persistent,
         json,
     )
@@ -2253,37 +2349,13 @@ fn perkey_fill(
     json: bool,
 ) -> Result<()> {
     let target = single_device(discovery, index)?;
-    let scheme = perkey_scheme(target, scheme)?;
-    let map = target
-        .model
-        .and_then(|model| model.per_key_map.as_ref())
-        .context(
-            "this device has no embedded per-key usage map; use `perkey set` with explicit keys",
-        )?;
-    let usages = map
-        .entries
-        .keys()
-        .map(|value| {
-            value
-                .parse::<u8>()
-                .with_context(|| format!("invalid HID usage {value:?} in device registry"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let zones = zones_from_usages(usages, scheme)?;
-    let color = color.parse::<RgbColor>()?;
-    let colors = zones
-        .iter()
-        .copied()
-        .map(|zone| (zone, color))
-        .collect::<Vec<_>>();
-    prepare_perkey(target)?;
-    let requests = PerKeyLightingV2::new(&target.device)?.write_colors(&colors, persistent)?;
+    let applied = live::apply_perkey_fill(target, scheme, color, persistent)?;
     print_perkey_result(
         target,
-        scheme,
-        Vec::new(),
-        colors.len(),
-        requests,
+        applied.scheme,
+        applied.keys,
+        applied.zone_count,
+        applied.requests,
         persistent,
         json,
     )
@@ -2314,7 +2386,7 @@ fn perkey_frame(
 
 fn perkey_probe(discovery: &Discovery, index: Option<usize>, json: bool) -> Result<()> {
     let target = single_device(discovery, index)?;
-    prepare_perkey(target)?;
+    live::prepare_perkey(target)?;
     let perkey = PerKeyLightingV2::new(&target.device)?;
     let probe = probe_zones();
     perkey.set_individual(&probe)?;
@@ -2354,129 +2426,6 @@ fn perkey_probe(discovery: &Discovery, index: Option<usize>, json: bool) -> Resu
         );
         Ok(())
     }
-}
-
-fn prepare_perkey(target: &ManagedDevice) -> Result<()> {
-    let rgb = RgbEffects::new(&target.device)
-        .context("per-key lighting requires the device's 0x8071 RGB control feature")?;
-    let capabilities = rgb.capabilities()?;
-    let cluster = capabilities
-        .clusters
-        .iter()
-        .filter(|cluster| cluster.effects.iter().any(|effect| effect.id == 0x01))
-        .find(|cluster| cluster.location & 0x0002 != 0)
-        .or_else(|| {
-            capabilities
-                .clusters
-                .iter()
-                .find(|cluster| cluster.effects.iter().any(|effect| effect.id == 0x01))
-        })
-        .context("no RGB cluster supports the fixed effect required for per-key frames")?;
-    let fixed = cluster
-        .effects
-        .iter()
-        .find(|effect| effect.id == 0x01)
-        .context("selected RGB cluster lost its fixed-effect capability")?;
-    let params = encode_effect(
-        Effect::parse("fixed")?,
-        &EffectOptions {
-            color: Some(RgbColor::BLACK),
-            ..Default::default()
-        },
-    )?;
-    rgb.set_sw_control(true, true)?;
-    if let Err(error) = rgb.set_effect(cluster.index, fixed.index, params, Persistence::Ram) {
-        let _ = rgb.set_sw_control(false, false);
-        return Err(error);
-    }
-    Ok(())
-}
-
-fn perkey_scheme(target: &ManagedDevice, explicit: Option<ZoneScheme>) -> Result<ZoneScheme> {
-    if let Some(scheme) = explicit {
-        return Ok(scheme);
-    }
-    target
-        .model
-        .and_then(|model| model.per_key_map.as_ref())
-        .and_then(|map| map.zone_scheme.as_deref())
-        .map(str::parse)
-        .transpose()?
-        .context("per-key zone numbering is unresolved for this device; pass --zone-scheme hidusage|solaar or declare zone_scheme in data/devices.json")
-}
-
-fn validate_model_key(target: &ManagedDevice, key: &ResolvedKey) -> Result<()> {
-    let Some(usage) = key.usage else {
-        return Ok(());
-    };
-    let Some(map) = target.model.and_then(|model| model.per_key_map.as_ref()) else {
-        return Ok(());
-    };
-    ensure!(
-        map.entries.contains_key(&usage.to_string()),
-        "key {} (HID usage 0x{usage:02X}) is not present in this device's per-key map",
-        key.name
-    );
-    Ok(())
-}
-
-fn select_rgb_zones(capabilities: &RgbCapabilities, value: &str) -> Result<Vec<u8>> {
-    if value.eq_ignore_ascii_case("all") || value.eq_ignore_ascii_case("ZONE_ALL") {
-        return Ok(capabilities
-            .clusters
-            .iter()
-            .map(|cluster| cluster.index)
-            .collect());
-    }
-    if let Some(location) = ghub_zone_location(value) {
-        let zones = capabilities
-            .clusters
-            .iter()
-            .filter(|cluster| cluster.location == location)
-            .map(|cluster| cluster.index)
-            .collect::<Vec<_>>();
-        ensure!(
-            !zones.is_empty(),
-            "RGB zone {value} (location 0x{location:04X}) is not reported by this device"
-        );
-        return Ok(zones);
-    }
-    let zone = parse_u8_arg(value).map_err(anyhow::Error::msg)?;
-    ensure!(
-        capabilities
-            .clusters
-            .iter()
-            .any(|cluster| cluster.index == zone),
-        "RGB zone {zone} does not exist (valid range: 0..{})",
-        capabilities.device.cluster_count.saturating_sub(1)
-    );
-    Ok(vec![zone])
-}
-
-fn ghub_zone_location(value: &str) -> Option<u16> {
-    Some(match value.to_ascii_uppercase().as_str() {
-        "ZONE_PRIMARY" => 2,
-        "ZONE_LOGO" | "ZONE_BRANDING" => 4,
-        "ZONE_ONE" => 8,
-        "ZONE_TWO" => 16,
-        "ZONE_THREE" => 32,
-        "ZONE_FOUR" => 64,
-        "ZONE_FIVE" => 128,
-        "ZONE_SIX" => 256,
-        "ZONE_SEVEN" => 512,
-        "ZONE_LEFT_SIDE" => 1024,
-        "ZONE_RIGHT_SIDE" => 2048,
-        "ZONE_COMBINED" => 4096,
-        "ZONE_TOP" => 8192,
-        "ZONE_BOTTOM" => 16384,
-        "ZONE_HALO" => 32768,
-        "ZONE_IDLE_STATE" => 129,
-        "ZONE_IN_USE_STATE" => 130,
-        "ZONE_MUTED_STATE" => 131,
-        "ZONE_SOFT_MUTED_STATE" => 132,
-        "ZONE_FULL_SUPPORT" => 65535,
-        _ => return None,
-    })
 }
 
 fn print_rgb_write(result: RgbWriteResult, json: bool) -> Result<()> {

@@ -404,6 +404,18 @@ impl<'a> Onboard<'a> {
         parse_current_profile(&response)
     }
 
+    pub fn set_active_profile(&self, profile: u16) -> Result<()> {
+        ensure!(profile > 0, "profile number must be greater than zero");
+        self.device
+            .call_short(self.feature, 3, &active_profile_request(profile))
+            .map_err(anyhow::Error::new)?;
+        ensure!(
+            self.current_profile()? == profile,
+            "active profile read-back did not match"
+        );
+        Ok(())
+    }
+
     pub fn get_crc(&self, sector: u16) -> Result<CrcResponse> {
         let raw = self
             .device
@@ -585,6 +597,10 @@ fn parse_current_profile(response: &[u8]) -> Result<u16> {
         response.len()
     );
     Ok(u16::from_be_bytes([response[0], response[1]]))
+}
+
+fn active_profile_request(profile: u16) -> [u8; 2] {
+    profile.to_be_bytes()
 }
 
 fn parse_crc_response(raw: [u8; 16]) -> CrcResponse {
@@ -2602,6 +2618,7 @@ mod tests {
     #[test]
     fn parses_rom_profile_and_crc_response_as_big_endian() {
         assert_eq!(parse_current_profile(&[0x01, 0x03]).unwrap(), 0x0103);
+        assert_eq!(active_profile_request(0x0103), [0x01, 0x03]);
         assert_eq!(crc_request(0x1234), [0x12, 0x34]);
         assert_eq!(
             execute_macro_request(0x1234, 0xABCD),
