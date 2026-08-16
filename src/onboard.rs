@@ -594,10 +594,11 @@ fn parse_crc_response(raw: [u8; 16]) -> CrcResponse {
     }
 }
 
+// GetCRC (fn 10) returns the CRCs of 8 consecutive sectors starting at the requested one,
+// as 8 x BE16 (verified on a G913: [0x49B1 0xD6A2 0xC79C 0xB92A ...] = sectors 1,2,3,4...).
+// So the first BE16 is authoritative; the tail is other sectors' CRCs, not padding.
 fn crc_response_is_unambiguous(response: &CrcResponse, expected: u16) -> bool {
     response.crc == expected
-        && (response.raw[2..].iter().all(|byte| *byte == 0)
-            || response.raw[2..].iter().all(|byte| *byte == 0xFF))
 }
 
 fn crc_request(sector: u16) -> [u8; 2] {
