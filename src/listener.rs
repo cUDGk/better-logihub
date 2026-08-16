@@ -12,7 +12,8 @@ use crate::mkeys::{self, FEATURE_MKEYS, FEATURE_MR, MKeyEvent};
 use crate::specialkeys::{self, FEATURE_SPECIAL_KEYS, SpecialKeyEvent};
 
 const FEATURE_WIRELESS_STATUS: u16 = 0x1D4B;
-const READ_SLICE: Duration = Duration::from_millis(25);
+// Short slice: transports are swept round-robin, so this bounds cross-receiver latency.
+const READ_SLICE: Duration = Duration::from_millis(2);
 const WATCHED_FEATURES: [u16; 5] = [
     FEATURE_GKEYS,
     FEATURE_MKEYS,

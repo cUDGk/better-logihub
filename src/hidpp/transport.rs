@@ -271,19 +271,16 @@ impl HidTransport {
             return Ok(Some(packet));
         }
 
+        // Latency matters here (G-key → action): a blocking read on handle A would delay an
+        // event on handle B by up to the poll slice, and the listener sweeps several transports.
+        // So poll every handle non-blocking (timeout 0) and sleep 1 ms between sweeps.
         let deadline = Instant::now() + timeout;
         let devices = self.read_devices();
-        while Instant::now() < deadline {
+        loop {
             for device in &devices {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                if remaining.is_zero() {
-                    return Ok(None);
-                }
-                let poll = remaining.min(READ_POLL_TIMEOUT);
-                let timeout_ms = poll.as_millis().clamp(1, i32::MAX as u128) as i32;
                 let mut buffer = [0_u8; LONG_LEN];
                 let count = device
-                    .read_timeout(&mut buffer, timeout_ms)
+                    .read_timeout(&mut buffer, 0)
                     .map_err(|error| HidppError::Io(error.to_string()))?;
                 if count == 0 {
                     continue;
@@ -292,8 +289,11 @@ impl HidTransport {
                     return Ok(Some(packet));
                 }
             }
+            if Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
-        Ok(None)
     }
 
     fn queue_unrelated(&self, packet: Packet) {
